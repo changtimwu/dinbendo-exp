@@ -122,7 +122,62 @@ flattens into `products.image_url` and `products.image_thumbnail_url`.
 
 Long tail: a small minority of shops carry the bulk of the photos.
 
-### Top 10 shops by product image count
+### Menu images vs per-dish galleries
+
+Field observation: shop owners on dinbendon.net don't have a dedicated
+"upload a menu picture" feature, so they hijack the per-product `image`
+slot — picking one arbitrary product on their menu and attaching a
+photo of the printed/handwritten menu to it. Shop **637143 (參時參)** is
+a typical example: 28 products, only the dish "酸甜梅子雞(炸)" carries
+an image, and the image is actually a photo of the shop's full menu.
+
+The signal is strong: when **`image_count` is tiny and the image:product
+ratio is low**, that image is almost certainly a menu photo, not a dish
+photo. Average ratio by image-count bucket:
+
+| Images on shop | Shops | Avg images/products |
+|---|---:|---:|
+| 1 | 957 | 0.058 |
+| 2 | 147 | 0.132 |
+| 3 – 5 | 139 | 0.338 |
+| 6 – 10 | 144 | 0.580 |
+| 11+ | 123 | 0.734 |
+
+The discontinuity between "1–2 images, ratio < 0.15" and "3+ images,
+ratio > 0.3" is the dividing line. Applying that as a classifier:
+
+| Pattern | Shops | % of all |
+|---|---:|---:|
+| No images at all | 11,541 | 88.4% |
+| **Menu image** (≤2 images, ratio ≤0.15) | **1,054** | **8.1%** |
+| Mixed / ambiguous | 243 | 1.9% |
+| Per-dish gallery (≥3 images, ratio ≥0.5) | 213 | 1.6% |
+
+So roughly **1 in 12 shops carries a menu image** in this style, and
+they outnumber proper per-dish photo galleries 5:1. To pull the menu
+image URL for each such shop:
+
+```sql
+WITH per_shop AS (
+  SELECT s.id, s.name,
+         COUNT(p.id) AS n_prod,
+         SUM(CASE WHEN p.image_url IS NOT NULL THEN 1 ELSE 0 END) AS n_img
+  FROM shops s
+  LEFT JOIN categories c ON c.shop_id = s.id
+  LEFT JOIN products   p ON p.category_id = c.id
+  GROUP BY s.id
+)
+SELECT ps.id, ps.name,
+       'https://dinbendon.net' || p.image_url AS menu_image_url
+FROM per_shop ps
+JOIN categories c ON c.shop_id = ps.id
+JOIN products   p ON p.category_id = c.id
+WHERE p.image_url IS NOT NULL
+  AND ps.n_img <= 2
+  AND 1.0 * ps.n_img / ps.n_prod <= 0.15;
+```
+
+### Top 10 shops by product image count (per-dish galleries)
 
 | shopId | Name | Images | Total products |
 |---:|---|---:|---:|
@@ -138,9 +193,7 @@ Long tail: a small minority of shops carry the bulk of the photos.
 | 256956 | 魷品味 | 58 | 59 |
 
 The image-rich cluster is overwhelmingly **packaged-food / dried-goods
-chains** (垂坤, 得倫, 宏裕行) where every SKU gets a photo. Lunchbox /
-takeout shops — the platform's bread and butter — are almost entirely
-text-only menus.
+chains** (垂坤, 得倫, 宏裕行) where every SKU gets a photo.
 
 ### Fetching an image
 
