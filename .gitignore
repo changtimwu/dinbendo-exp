@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# scraper output
+shops.jsonl
+scanned.jsonl
