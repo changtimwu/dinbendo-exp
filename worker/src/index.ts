@@ -704,39 +704,88 @@ async function renderAsk(env: Env, url: URL): Promise<Response> {
     return html(layout("AI 搜尋", askFormHtml("") + `<p class="meta">輸入一句話開始 — 例如「古亭站附近的炒飯」「cheapest 便當 in 內湖」「最新的飲料店」。</p>`));
   }
 
-  let intent: ParsedIntent;
-  try {
-    intent = await parseIntent(env, q);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return html(layout("AI 搜尋", askFormHtml(q) + `
-      <p class="empty">⚠️ AI 解析失敗：${escapeHtml(msg)}</p>
-      <p><a href="/">改用手動搜尋 →</a></p>
-    `));
-  }
+  // Streamed response: the form + "searching…" spinner render in <100ms;
+  // intent parse + geocode + SQL stream in when ready.
+  const encoder = new TextEncoder();
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
 
-  // Geocode the landmark if present.
-  let geo: Geocode | null = null;
-  let near: Near | null = null;
-  if (intent.near_landmark) {
-    geo = await geocode(env, intent.near_landmark);
-    if (geo) near = { lat: geo.lat, lng: geo.lng, radiusKm: PROXIMITY_RADIUS_KM };
-  }
+  const earlyHtml = layoutHead("AI 搜尋: " + q) + askFormHtml(q) + /* html */ `
+    <div id="loading" class="searching" aria-live="polite">
+      <span class="spinner"></span>
+      <span>搜尋中…</span>
+      <span class="status">解析查詢 → 地圖定位 → 查詢菜單</span>
+    </div>
+  `;
+  writer.write(encoder.encode(earlyHtml));
 
-  let resultsHtml: string;
-  if (intent.result_grain === "product") {
-    const rows = await runProductSearch(env.DB, intent, near);
-    resultsHtml = rows.length
-      ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
-      : `<p class="empty">沒有符合的菜單項目。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
-  } else {
-    const rows = await runShopSearch(env.DB, intent, near);
-    resultsHtml = rows.length
-      ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
-      : `<p class="empty">沒有符合的店家。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
-  }
+  // Run the work concurrently with the response flush. The Worker keeps
+  // executing until the stream is closed, so this background task lives
+  // for the full response duration without needing ctx.waitUntil.
+  void (async () => {
+    let intent: ParsedIntent | null = null;
+    let geo: Geocode | null = null;
+    let near: Near | null = null;
+    const t0 = Date.now();
+    let t1 = t0, t2 = t0, t3 = t0;
 
-  return html(layout("AI 搜尋: " + q, askFormHtml(q) + intentBlockHtml(intent, geo) + resultsHtml));
+    try {
+      intent = await parseIntent(env, q);
+      t1 = Date.now();
+
+      if (intent.near_landmark) {
+        geo = await geocode(env, intent.near_landmark);
+        if (geo) near = { lat: geo.lat, lng: geo.lng, radiusKm: PROXIMITY_RADIUS_KM };
+      }
+      t2 = Date.now();
+
+      let resultsHtml: string;
+      if (intent.result_grain === "product") {
+        const rows = await runProductSearch(env.DB, intent, near);
+        resultsHtml = rows.length
+          ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
+          : `<p class="empty">沒有符合的菜單項目。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+        t3 = Date.now();
+        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=product rows=${rows.length}`);
+      } else {
+        const rows = await runShopSearch(env.DB, intent, near);
+        resultsHtml = rows.length
+          ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
+          : `<p class="empty">沒有符合的店家。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+        t3 = Date.now();
+        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=shop rows=${rows.length}`);
+      }
+
+      const lateHtml = /* html */ `
+        <style>#loading{display:none!important}</style>
+        ${intentBlockHtml(intent, geo)}
+        ${resultsHtml}
+        <div class="timings">
+          <small>耗時：<code>parseIntent ${t1 - t0}ms</code> · <code>geocode ${t2 - t1}ms${geo ? "" : intent.near_landmark ? " (miss)" : " (skipped)"}</code> · <code>D1 query ${t3 - t2}ms</code> · 總 <code>${t3 - t0}ms</code></small>
+        </div>
+      `;
+      writer.write(encoder.encode(lateHtml));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      writer.write(encoder.encode(/* html */ `
+        <style>#loading{display:none!important}</style>
+        <p class="empty">⚠️ AI 解析失敗：${escapeHtml(msg)}</p>
+        <p><a href="/">改用手動搜尋 →</a></p>
+      `));
+      console.log(`[ask] q=${JSON.stringify(q)} ERROR ${msg}`);
+    } finally {
+      writer.write(encoder.encode(layoutFooter()));
+      writer.close();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-cache",
+      "transfer-encoding": "chunked",
+    },
+  });
 }
 
 async function renderHealth(env: Env): Promise<Response> {
@@ -782,6 +831,10 @@ function formatPrice(p: number | null): string {
 }
 
 function layout(title: string, body: string): string {
+  return layoutHead(title) + body + layoutFooter();
+}
+
+function layoutHead(title: string): string {
   return /* html */ `<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -823,11 +876,20 @@ function layout(title: string, body: string): string {
   .intent .geo-miss { color: #b56500; }
   .badge.dist { background: #e6f4ec; color: #1f7a3a; }
   .dist-inline { color: #1f7a3a; font-weight: 600; }
+  .searching { display: flex; align-items: center; gap: .6rem; padding: .8rem 1rem; background: #fafbfd; border: 1px solid #e6e9ef; border-radius: 8px; margin: .6rem 0 1rem; color: #555; }
+  .searching .status { color: #888; font-size: .9em; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #d6d9e0; border-top-color: #6a3aff; border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .timings { margin-top: 1.5rem; padding-top: .8rem; border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); color: #888; font-size: .8em; }
+  .timings code { background: color-mix(in srgb, currentColor 6%, transparent); padding: 0 .35em; border-radius: 3px; }
   @media (prefers-color-scheme: dark) {
     .intent .geo { color: #aab2c0; }
     .intent .geo-miss { color: #f3c463; }
     .badge.dist { background: #1f3a2a; color: #7ad58e; }
     .dist-inline { color: #7ad58e; }
+    .searching { background: #181c25; border-color: #2a2c33; color: #b9bfca; }
+    .spinner { border-color: #2a2c33; border-top-color: #c6b6ff; }
+    .timings { color: #8a93a6; }
   }
   ul.results.products li.product { display: grid; grid-template-columns: 56px 1fr auto; gap: .7rem; align-items: center; padding: .6rem 0; border-bottom: 1px solid color-mix(in srgb, currentColor 8%, transparent); }
   ul.results.products .thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #eee; }
@@ -898,7 +960,11 @@ function layout(title: string, body: string): string {
 </head>
 <body>
 <header class="brand"><a href="/">${escapeHtml(SITE_TITLE)}</a><small>dinbendon.net 公開資料瀏覽</small></header>
-<main>${body}</main>
+<main>`;
+}
+
+function layoutFooter(): string {
+  return /* html */ `</main>
 <footer>data 來源於 dinbendon.net · <a href="${SOURCE_URL}">source</a></footer>
 </body>
 </html>`;
