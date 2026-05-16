@@ -125,13 +125,17 @@ function rowHtml(r: {
   owner_name: string | null;
   last_modified_date: string | null;
   img_count: number;
+  dist_km?: number;
 }): string {
   const imgBadge = r.img_count > 0
     ? `<span class="badge" title="${r.img_count} 張產品圖">📷 ${r.img_count}</span>`
     : "";
+  const distBadge = r.dist_km != null
+    ? `<span class="badge dist">${r.dist_km.toFixed(2)} km</span>`
+    : "";
   return /* html */ `
     <li>
-      <a href="/shop/${r.id}" class="name">${escapeHtml(r.name)}</a> ${imgBadge}
+      <a href="/shop/${r.id}" class="name">${escapeHtml(r.name)}</a> ${imgBadge}${distBadge}
       <div class="addr">${escapeHtml(r.address ?? "—")}</div>
       <div class="meta">
         ${r.tel_no ? `☎ ${escapeHtml(r.tel_no)}` : ""}
@@ -274,6 +278,7 @@ async function renderShop(env: Env, id: number): Promise<Response> {
 type ParsedIntent = {
   item_keywords: string[];
   area: string | null;
+  near_landmark: string | null;  // raw landmark text (MRT station, building, etc.) for geocoding
   service_type: string | null;
   sort_by: "price_asc" | "price_desc" | "newest" | "relevance";
   max_price: number | null;
@@ -287,6 +292,7 @@ const INTENT_SCHEMA = {
   properties: {
     item_keywords: { type: "array", items: { type: "string" } },
     area: { type: ["string", "null"] },
+    near_landmark: { type: ["string", "null"] },
     service_type: { type: ["string", "null"] },
     sort_by: { type: "string", enum: ["price_asc", "price_desc", "newest", "relevance"] },
     max_price: { type: ["number", "null"] },
@@ -295,11 +301,15 @@ const INTENT_SCHEMA = {
     rationale: { type: "string" },
   },
   required: [
-    "item_keywords", "area", "service_type", "sort_by",
+    "item_keywords", "area", "near_landmark", "service_type", "sort_by",
     "max_price", "result_grain", "limit", "rationale",
   ],
   additionalProperties: false,
 };
+
+const PROXIMITY_RADIUS_KM = 1.5;
+const NL_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+const NOMINATIM_UA = "dinbendon.itsi.xyz (https://dinbendon.itsi.xyz; https://github.com/changtimwu/dinbendo-exp)";
 
 const SERVICE_TYPES = ["便當", "中式", "麵食", "飲料", "小吃", "日式", "其他", "甜點", "南洋", "西式"] as const;
 const SORTS = ["price_asc", "price_desc", "newest", "relevance"] as const;
@@ -307,36 +317,74 @@ const SORTS = ["price_asc", "price_desc", "newest", "relevance"] as const;
 async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
   const system = [
     "You parse food-delivery search queries for a Taiwanese platform into JSON.",
-    "The platform's data is in Traditional Chinese. When the user uses English names for places or dishes, translate to the Taiwanese term. Examples: Da'an → 大安, Xinyi → 信義, Songshan → 松山, Neihu → 內湖, soup dumplings → 小籠包, lunchbox → 便當, bubble tea → 珍珠奶茶.",
+    "The platform's data is in Traditional Chinese. When the user uses English names for places or dishes, translate to the Taiwanese term. Examples: Da'an → 大安, Xinyi → 信義, Songshan → 松山, Neihu → 內湖, soup dumplings → 小籠包, lunchbox → 便當, bubble tea → 珍珠奶茶, fried rice → 炒飯.",
     `Service types available: ${SERVICE_TYPES.join(", ")}.`,
-    "If the query is about restaurants generally, leave item_keywords empty and set result_grain=\"shop\". If the query is about a specific dish, fill item_keywords and set result_grain=\"product\".",
-    "Rationale: a one-line Chinese summary of what you understood (e.g. \"大安最便宜的小籠包\").",
-    "limit defaults to 20.",
+    "Fields:",
+    "  area:           a Taipei-area district / city name from the delivery list (e.g. 大安, 內湖, 台北市). Use ONLY for broad districts. Leave null if the user named something more specific (an MRT station, building, road, university, etc.).",
+    "  near_landmark:  a specific landmark string suitable for geocoding (e.g. \"古亭站\", \"台北車站\", \"台灣大學\", \"信義誠品\", \"101\"). Use whenever the user mentions a station, building, university, road, or other point of interest — even if you also recognize a containing district.",
+    "  item_keywords:  dish names (e.g. \"炒飯\", \"小籠包\"). Empty for restaurant-level queries.",
+    "  result_grain:   \"product\" if a specific dish is named, otherwise \"shop\".",
+    "  rationale:      one-line Chinese summary of what you understood (e.g. \"大安最便宜的小籠包\").",
+    "  limit:          default 20.",
+    "Output only valid JSON.",
     "Examples:",
     'Q: cheapest soup dumplings in Da\'an district',
-    'A: {"item_keywords":["小籠包"],"area":"大安","service_type":null,"sort_by":"price_asc","max_price":null,"result_grain":"product","limit":20,"rationale":"大安最便宜的小籠包"}',
+    'A: {"item_keywords":["小籠包"],"area":"大安","near_landmark":null,"service_type":null,"sort_by":"price_asc","max_price":null,"result_grain":"product","limit":20,"rationale":"大安最便宜的小籠包"}',
+    "Q: 古亭站附近的炒飯",
+    'A: {"item_keywords":["炒飯"],"area":null,"near_landmark":"古亭站","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"古亭站附近的炒飯"}',
+    "Q: fried rice near Taipei Main Station",
+    'A: {"item_keywords":["炒飯"],"area":null,"near_landmark":"台北車站","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"台北車站附近的炒飯"}',
     "Q: 便當 in 內湖 under 100",
-    'A: {"item_keywords":[],"area":"內湖","service_type":"便當","sort_by":"price_asc","max_price":100,"result_grain":"shop","limit":20,"rationale":"內湖區、100元以下的便當店"}',
+    'A: {"item_keywords":[],"area":"內湖","near_landmark":null,"service_type":"便當","sort_by":"price_asc","max_price":100,"result_grain":"shop","limit":20,"rationale":"內湖區、100元以下的便當店"}',
     "Q: 新開的飲料店",
-    'A: {"item_keywords":[],"area":null,"service_type":"飲料","sort_by":"newest","max_price":null,"result_grain":"shop","limit":20,"rationale":"最新加入的飲料店"}',
-    "Output only valid JSON.",
+    'A: {"item_keywords":[],"area":null,"near_landmark":null,"service_type":"飲料","sort_by":"newest","max_price":null,"result_grain":"shop","limit":20,"rationale":"最新加入的飲料店"}',
+    "Q: 台大附近的咖啡店",
+    'A: {"item_keywords":[],"area":null,"near_landmark":"台灣大學","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"shop","limit":20,"rationale":"台大附近的咖啡店"}',
   ].join("\n");
 
   const res = await env.AI.run(
-    "@cf/meta/llama-3.1-8b-instruct" as keyof AiModels,
+    NL_MODEL as keyof AiModels,
     {
       messages: [
         { role: "system", content: system },
         { role: "user", content: query },
       ],
       response_format: { type: "json_schema", json_schema: INTENT_SCHEMA },
-      max_tokens: 400,
+      // Gemma 4 26b is a reasoning model; the response burns tokens on `reasoning`
+      // before emitting `content`. Give it room for both.
+      max_tokens: 2000,
     } as never,
-  ) as unknown as { response?: unknown };
+  ) as unknown as Record<string, unknown>;
 
-  const raw = res?.response;
-  const obj = typeof raw === "string" ? JSON.parse(raw) : (raw as Record<string, unknown> | undefined);
-  if (!obj || typeof obj !== "object") throw new Error("model returned no JSON");
+  // Extract the text the model produced. Workers AI normalizes responses
+  // differently per model family:
+  //   - Llama / Mistral instruct → { response: "..." }
+  //   - Gemma 4 / OpenAI-style    → { choices: [{ message: { content: "...", reasoning: "..." } }] }
+  let text: string | unknown = res?.response;
+  if (typeof text !== "string" && Array.isArray(res?.choices)) {
+    const choice = (res.choices as Array<{ message?: { content?: unknown; reasoning?: unknown } }>)[0];
+    text = choice?.message?.content;
+    if (typeof text !== "string" || !text) text = choice?.message?.reasoning;
+  }
+
+  let obj: Record<string, unknown> | undefined;
+  if (typeof text === "string") {
+    try {
+      obj = JSON.parse(text);
+    } catch {
+      // Recover a JSON object embedded in prose (```json … ``` or reasoning trace).
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) {
+        try { obj = JSON.parse(m[0]); } catch { /* fall through */ }
+      }
+    }
+  } else if (text && typeof text === "object") {
+    obj = text as Record<string, unknown>;
+  }
+  if (!obj || typeof obj !== "object") {
+    const sample = typeof text === "string" ? text.slice(0, 200) : JSON.stringify(res).slice(0, 200);
+    throw new Error(`model returned no JSON: ${sample}`);
+  }
 
   const sort = (SORTS as readonly string[]).includes(obj.sort_by as string)
     ? (obj.sort_by as ParsedIntent["sort_by"])
@@ -348,6 +396,7 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
   return {
     item_keywords: items,
     area: typeof obj.area === "string" && obj.area.length > 0 ? obj.area : null,
+    near_landmark: typeof obj.near_landmark === "string" && obj.near_landmark.length > 0 ? obj.near_landmark : null,
     service_type: typeof obj.service_type === "string" && obj.service_type.length > 0 ? obj.service_type : null,
     sort_by: sort,
     max_price: typeof obj.max_price === "number" && isFinite(obj.max_price) ? obj.max_price : null,
@@ -356,6 +405,83 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
     rationale: typeof obj.rationale === "string" ? obj.rationale : "",
   };
 }
+
+type Geocode = { lat: number; lng: number; display_name: string };
+
+async function geocode(env: Env, query: string): Promise<Geocode | null> {
+  const key = query.trim();
+  if (!key) return null;
+
+  // 1. Cache lookup
+  const cached = await env.DB.prepare(
+    "SELECT lat, lng, display_name FROM geocache WHERE query = ?1"
+  ).bind(key).first<{ lat: number | null; lng: number | null; display_name: string | null }>();
+  if (cached) {
+    if (cached.lat == null || cached.lng == null) return null;
+    return { lat: cached.lat, lng: cached.lng, display_name: cached.display_name ?? key };
+  }
+
+  // 2. Cache miss → call Nominatim. Country-restricted to Taiwan; one result.
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", key);
+  url.searchParams.set("countrycodes", "tw");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("format", "json");
+  url.searchParams.set("addressdetails", "0");
+
+  let hit: Geocode | null = null;
+  try {
+    const r = await fetch(url.toString(), {
+      headers: { "user-agent": NOMINATIM_UA, "accept": "application/json" },
+      cf: { cacheTtl: 86400, cacheEverything: true } as RequestInitCfProperties,
+    });
+    if (r.ok) {
+      const arr = (await r.json()) as Array<{ lat: string; lon: string; display_name: string }>;
+      if (Array.isArray(arr) && arr.length > 0) {
+        const lat = parseFloat(arr[0].lat);
+        const lng = parseFloat(arr[0].lon);
+        if (isFinite(lat) && isFinite(lng)) {
+          hit = { lat, lng, display_name: arr[0].display_name };
+        }
+      }
+    }
+  } catch {
+    // network or JSON failure — treat as miss; we'll still cache the null
+    // so we don't hammer Nominatim with retries for the same bad term.
+  }
+
+  // 3. Save (negative cache included so repeat-misses stay cheap)
+  await env.DB.prepare(
+    "INSERT OR REPLACE INTO geocache(query, lat, lng, display_name, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+  ).bind(
+    key,
+    hit?.lat ?? null,
+    hit?.lng ?? null,
+    hit?.display_name ?? null,
+    Math.floor(Date.now() / 1000),
+  ).run();
+
+  return hit;
+}
+
+function distanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function boundingBox(lat: number, lng: number, radiusKm: number): { latMin: number; latMax: number; lngMin: number; lngMax: number } {
+  const dLat = radiusKm / 111;                                  // 1° lat ≈ 111 km
+  const dLng = radiusKm / (111 * Math.cos(lat * Math.PI / 180)); // narrows toward the poles
+  return { latMin: lat - dLat, latMax: lat + dLat, lngMin: lng - dLng, lngMax: lng + dLng };
+}
+
+type Near = { lat: number; lng: number; radiusKm: number };
 
 type ProductRow = {
   shop_id: number;
@@ -366,9 +492,12 @@ type ProductRow = {
   product: string | null;
   image_thumbnail_url: string | null;
   price: number | null;
+  lat?: number | null;
+  lng?: number | null;
+  dist_km?: number;
 };
 
-async function runProductSearch(db: D1Database, intent: ParsedIntent): Promise<ProductRow[]> {
+async function runProductSearch(db: D1Database, intent: ParsedIntent, near: Near | null): Promise<ProductRow[]> {
   const kws = intent.item_keywords.slice(0, 5);
   if (!kws.length) return [];
 
@@ -392,25 +521,49 @@ async function runProductSearch(db: D1Database, intent: ParsedIntent): Promise<P
     bindings.push(intent.max_price);
     filters.push(`v.price <= ?${bindings.length}`);
   }
+  if (near) {
+    const bb = boundingBox(near.lat, near.lng, near.radiusKm);
+    bindings.push(bb.latMin, bb.latMax, bb.lngMin, bb.lngMax);
+    filters.push(`s.lat IS NOT NULL AND s.lat BETWEEN ?${bindings.length - 3} AND ?${bindings.length - 2}`);
+    filters.push(`s.lng BETWEEN ?${bindings.length - 1} AND ?${bindings.length}`);
+  }
 
   let orderBy = "s.last_modified_date DESC";
   if (intent.sort_by === "price_asc") orderBy = "(v.price IS NULL), v.price ASC";
   else if (intent.sort_by === "price_desc") orderBy = "(v.price IS NULL), v.price DESC";
   // newest / relevance → date desc (current default)
 
+  // When proximity is active, fetch a wider candidate pool and re-rank by distance in JS.
+  const fetchLimit = near ? Math.max(intent.limit * 5, 50) : intent.limit;
+
   const sql = `
     SELECT s.id AS shop_id, s.name AS shop_name, s.address, s.tel_no,
-           c.name AS category, p.name AS product, p.image_thumbnail_url, v.price
+           c.name AS category, p.name AS product, p.image_thumbnail_url, v.price,
+           s.lat, s.lng
     FROM products p
     JOIN categories c ON c.id = p.category_id
     JOIN shops      s ON s.id = c.shop_id
     LEFT JOIN variations v ON v.product_id = p.id
     WHERE ${filters.join(" AND ")}
     ORDER BY ${orderBy}
-    LIMIT ${intent.limit}
+    LIMIT ${fetchLimit}
   `;
   const r = await db.prepare(sql).bind(...bindings).all<ProductRow>();
-  return r.results ?? [];
+  const rows = r.results ?? [];
+  if (!near) return rows;
+
+  const withDist = rows
+    .filter(x => x.lat != null && x.lng != null)
+    .map(x => ({ ...x, dist_km: distanceKm(near.lat, near.lng, x.lat!, x.lng!) }))
+    .filter(x => x.dist_km! <= near.radiusKm);
+
+  // For "cheapest near X" we want price first, but only among nearby; rows are
+  // already in price-asc order from SQL, so a stable filter preserves it. For
+  // relevance/newest, sort by distance.
+  if (intent.sort_by !== "price_asc" && intent.sort_by !== "price_desc") {
+    withDist.sort((a, b) => a.dist_km! - b.dist_km!);
+  }
+  return withDist.slice(0, intent.limit);
 }
 
 type ShopRow = {
@@ -421,9 +574,12 @@ type ShopRow = {
   owner_name: string | null;
   last_modified_date: string | null;
   img_count: number;
+  lat?: number | null;
+  lng?: number | null;
+  dist_km?: number;
 };
 
-async function runShopSearch(db: D1Database, intent: ParsedIntent): Promise<ShopRow[]> {
+async function runShopSearch(db: D1Database, intent: ParsedIntent, near: Near | null): Promise<ShopRow[]> {
   const bindings: unknown[] = [];
   const filters: string[] = [];
 
@@ -446,23 +602,37 @@ async function runShopSearch(db: D1Database, intent: ParsedIntent): Promise<Shop
     }
     filters.push(`(${parts.join(" OR ")})`);
   }
+  if (near) {
+    const bb = boundingBox(near.lat, near.lng, near.radiusKm);
+    bindings.push(bb.latMin, bb.latMax, bb.lngMin, bb.lngMax);
+    filters.push(`s.lat IS NOT NULL AND s.lat BETWEEN ?${bindings.length - 3} AND ?${bindings.length - 2}`);
+    filters.push(`s.lng BETWEEN ?${bindings.length - 1} AND ?${bindings.length}`);
+  }
 
-  // Refuse a totally unconstrained query (would just dump latest).
-  // If everything is null/empty, fall back to "newest" tour at small limit.
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   const orderBy = "s.last_modified_date DESC";
+  const fetchLimit = near ? Math.max(intent.limit * 5, 50) : intent.limit;
 
   const sql = `
     SELECT s.id, s.name, s.address, s.tel_no, s.owner_name, s.last_modified_date,
+           s.lat, s.lng,
            COALESCE((SELECT COUNT(*) FROM products p JOIN categories c ON c.id = p.category_id
                      WHERE c.shop_id = s.id AND p.image_url IS NOT NULL), 0) AS img_count
     FROM shops s
     ${where}
     ORDER BY ${orderBy}
-    LIMIT ${intent.limit}
+    LIMIT ${fetchLimit}
   `;
   const r = await db.prepare(sql).bind(...bindings).all<ShopRow>();
-  return r.results ?? [];
+  const rows = r.results ?? [];
+  if (!near) return rows;
+
+  return rows
+    .filter(x => x.lat != null && x.lng != null)
+    .map(x => ({ ...x, dist_km: distanceKm(near.lat, near.lng, x.lat!, x.lng!) }))
+    .filter(x => x.dist_km! <= near.radiusKm)
+    .sort((a, b) => a.dist_km! - b.dist_km!)
+    .slice(0, intent.limit);
 }
 
 function askFormHtml(q: string): string {
@@ -475,19 +645,30 @@ function askFormHtml(q: string): string {
   `;
 }
 
-function intentBlockHtml(intent: ParsedIntent): string {
+function intentBlockHtml(intent: ParsedIntent, geo: Geocode | null): string {
   const chips: string[] = [];
   if (intent.item_keywords.length) chips.push("關鍵字: " + intent.item_keywords.join(", "));
   if (intent.area) chips.push("地區: " + intent.area);
+  if (intent.near_landmark) {
+    chips.push(geo
+      ? `📍 ${intent.near_landmark} (${PROXIMITY_RADIUS_KM}km)`
+      : `📍 ${intent.near_landmark} (找不到位置)`);
+  }
   if (intent.service_type) chips.push("類型: " + intent.service_type);
   if (intent.max_price !== null) chips.push("≤ $" + intent.max_price);
   if (intent.sort_by === "price_asc") chips.push("最便宜");
   else if (intent.sort_by === "price_desc") chips.push("最貴");
   else if (intent.sort_by === "newest") chips.push("最新");
+  const geoLine = geo
+    ? `<div class="geo">📍 <small>${escapeHtml(geo.display_name)}</small></div>`
+    : intent.near_landmark
+      ? `<div class="geo geo-miss">⚠️ <small>「${escapeHtml(intent.near_landmark)}」找不到座標，已忽略附近條件</small></div>`
+      : "";
   return /* html */ `
     <div class="intent">
       <div><span class="label">✨ 理解為：</span><strong>${escapeHtml(intent.rationale || "(沒有 rationale)")}</strong></div>
       ${chips.length ? `<div class="chips">${chips.map(c => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div>` : ""}
+      ${geoLine}
     </div>
   `;
 }
@@ -496,6 +677,9 @@ function productRowHtml(r: ProductRow): string {
   const thumb = r.image_thumbnail_url
     ? `<img class="thumb" loading="lazy" src="https://dinbendon.net${escapeAttr(r.image_thumbnail_url)}" alt="" />`
     : `<span class="thumb thumb-empty"></span>`;
+  const dist = r.dist_km != null
+    ? `<span class="dist-inline">${r.dist_km.toFixed(2)} km</span>`
+    : "";
   return /* html */ `
     <li class="product">
       ${thumb}
@@ -504,6 +688,7 @@ function productRowHtml(r: ProductRow): string {
         <div class="pmeta">
           <a href="/shop/${r.shop_id}">${escapeHtml(r.shop_name)}</a>
           ${r.category ? ` · ${escapeHtml(r.category)}` : ""}
+          ${dist ? ` · ${dist}` : ""}
         </div>
         ${r.address ? `<div class="paddr">${escapeHtml(r.address)}</div>` : ""}
       </div>
@@ -516,7 +701,7 @@ async function renderAsk(env: Env, url: URL): Promise<Response> {
   const q = (url.searchParams.get("q") ?? "").trim();
 
   if (!q) {
-    return html(layout("AI 搜尋", askFormHtml("") + `<p class="meta">輸入一句話開始 — 例如「cheapest 便當 in 內湖」「最新的飲料店」「最便宜的小籠包」。</p>`));
+    return html(layout("AI 搜尋", askFormHtml("") + `<p class="meta">輸入一句話開始 — 例如「古亭站附近的炒飯」「cheapest 便當 in 內湖」「最新的飲料店」。</p>`));
   }
 
   let intent: ParsedIntent;
@@ -530,20 +715,28 @@ async function renderAsk(env: Env, url: URL): Promise<Response> {
     `));
   }
 
-  let resultsHtml: string;
-  if (intent.result_grain === "product") {
-    const rows = await runProductSearch(env.DB, intent);
-    resultsHtml = rows.length
-      ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
-      : `<p class="empty">沒有符合的菜單項目。試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
-  } else {
-    const rows = await runShopSearch(env.DB, intent);
-    resultsHtml = rows.length
-      ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
-      : `<p class="empty">沒有符合的店家。試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+  // Geocode the landmark if present.
+  let geo: Geocode | null = null;
+  let near: Near | null = null;
+  if (intent.near_landmark) {
+    geo = await geocode(env, intent.near_landmark);
+    if (geo) near = { lat: geo.lat, lng: geo.lng, radiusKm: PROXIMITY_RADIUS_KM };
   }
 
-  return html(layout("AI 搜尋: " + q, askFormHtml(q) + intentBlockHtml(intent) + resultsHtml));
+  let resultsHtml: string;
+  if (intent.result_grain === "product") {
+    const rows = await runProductSearch(env.DB, intent, near);
+    resultsHtml = rows.length
+      ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
+      : `<p class="empty">沒有符合的菜單項目。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+  } else {
+    const rows = await runShopSearch(env.DB, intent, near);
+    resultsHtml = rows.length
+      ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
+      : `<p class="empty">沒有符合的店家。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+  }
+
+  return html(layout("AI 搜尋: " + q, askFormHtml(q) + intentBlockHtml(intent, geo) + resultsHtml));
 }
 
 async function renderHealth(env: Env): Promise<Response> {
@@ -626,6 +819,16 @@ function layout(title: string, body: string): string {
   .intent .label { color: #6a3aff; font-weight: 600; margin-right: .3em; }
   .intent .chips { margin-top: .35rem; display: flex; flex-wrap: wrap; gap: .35rem; }
   .intent .chip { background: #ece5ff; color: #4a2ab8; padding: .12em .55em; border-radius: 4px; font-size: .82em; }
+  .intent .geo { color: #666; font-size: .82em; margin-top: .35rem; }
+  .intent .geo-miss { color: #b56500; }
+  .badge.dist { background: #e6f4ec; color: #1f7a3a; }
+  .dist-inline { color: #1f7a3a; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .intent .geo { color: #aab2c0; }
+    .intent .geo-miss { color: #f3c463; }
+    .badge.dist { background: #1f3a2a; color: #7ad58e; }
+    .dist-inline { color: #7ad58e; }
+  }
   ul.results.products li.product { display: grid; grid-template-columns: 56px 1fr auto; gap: .7rem; align-items: center; padding: .6rem 0; border-bottom: 1px solid color-mix(in srgb, currentColor 8%, transparent); }
   ul.results.products .thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #eee; }
   ul.results.products .thumb-empty { display: inline-block; background: #f0f0f4; }

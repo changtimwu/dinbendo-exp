@@ -76,12 +76,16 @@ Cloudflare Worker (in [`worker/`](worker/)) backed by a D1 database.
 
 - `/` — structured search by name/address and delivery area, plus a
   natural-language search box at the top.
-- `/ask?q=…` — natural-language search. Cloudflare Workers AI parses
-  the query into a structured intent (item keywords, area, service
-  type, price ceiling, sort) and the worker runs a parameterized D1
-  query. Translates English place / dish names (Da'an → 大安, soup
-  dumplings → 小籠包). The parsed intent is shown above the results
-  for transparency.
+- `/ask?q=…` — natural-language search. Cloudflare Workers AI
+  (`@cf/google/gemma-4-26b-a4b-it`, see [`model-pricing.md`](model-pricing.md))
+  parses the query into a structured intent (item keywords, area,
+  landmark, service type, price ceiling, sort) and the worker runs a
+  parameterized D1 query. Translates English place / dish names
+  (Da'an → 大安, soup dumplings → 小籠包). Specific landmarks (MRT
+  stations, buildings, universities) trigger geocoding via OSM
+  Nominatim (cached in D1's `geocache` table); shops are then ranked
+  by haversine distance within a 1.5 km radius. The parsed intent
+  plus the resolved landmark address are shown above the results.
 - `/shop/:id` — shop detail with menu, auto-labeling its image gallery
   as 菜單照片 or 產品照片 using the heuristic from [`stats.md`](stats.md).
 - `/healthz` — JSON sanity check.
@@ -89,6 +93,9 @@ Cloudflare Worker (in [`worker/`](worker/)) backed by a D1 database.
 Sample NL queries:
 
 ```
+/ask?q=古亭站附近的炒飯              ← landmark → geocode → 1.5 km radius
+/ask?q=台北車站附近的便當            ← English-friendly: works in either language
+/ask?q=fried rice near Taipei 101    ← English place + dish, auto-translated
 /ask?q=cheapest soup dumplings in Da'an district
 /ask?q=便當 in 內湖 under 100
 /ask?q=新開的飲料店
