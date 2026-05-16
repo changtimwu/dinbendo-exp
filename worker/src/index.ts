@@ -9,6 +9,7 @@
 
 export interface Env {
   DB: D1Database;
+  AI: Ai;
 }
 
 const SITE_TITLE = "DinBenDon Browser";
@@ -21,6 +22,7 @@ export default {
 
     try {
       if (path === "/") return await renderSearch(env, url);
+      if (path === "/ask") return await renderAsk(env, url);
       if (path === "/healthz") return await renderHealth(env);
       const shopMatch = path.match(/^\/shop\/(\d+)\/?$/);
       if (shopMatch) return await renderShop(env, Number(shopMatch[1]));
@@ -85,8 +87,16 @@ async function renderSearch(env: Env, url: URL): Promise<Response> {
   }
 
   const body = /* html */ `
+    <form action="/ask" method="get" class="ask-on-home">
+      <label>✨ 自然語言搜尋</label>
+      <div class="ask-row">
+        <input type="search" name="q" placeholder="例：cheapest 便當 in 內湖" />
+        <button type="submit">問</button>
+      </div>
+      <p class="hint">用一句話描述你想找的東西 — 模型會幫你翻譯地名 (Da'an → 大安) 與菜色。</p>
+    </form>
     <form action="/" method="get" class="search">
-      <input type="search" name="q" value="${escapeHtml(q)}" placeholder="店名 / 地址" autofocus />
+      <input type="search" name="q" value="${escapeHtml(q)}" placeholder="店名 / 地址" />
       <input type="text" name="area" value="${escapeHtml(area)}" placeholder="送達地區 (例: 台北市)" />
       <button type="submit">搜尋</button>
     </form>
@@ -259,6 +269,283 @@ async function renderShop(env: Env, id: number): Promise<Response> {
   return html(layout(shop.name, body));
 }
 
+// ─────────── /ask — natural-language search ───────────
+
+type ParsedIntent = {
+  item_keywords: string[];
+  area: string | null;
+  service_type: string | null;
+  sort_by: "price_asc" | "price_desc" | "newest" | "relevance";
+  max_price: number | null;
+  result_grain: "product" | "shop";
+  limit: number;
+  rationale: string;
+};
+
+const INTENT_SCHEMA = {
+  type: "object",
+  properties: {
+    item_keywords: { type: "array", items: { type: "string" } },
+    area: { type: ["string", "null"] },
+    service_type: { type: ["string", "null"] },
+    sort_by: { type: "string", enum: ["price_asc", "price_desc", "newest", "relevance"] },
+    max_price: { type: ["number", "null"] },
+    result_grain: { type: "string", enum: ["product", "shop"] },
+    limit: { type: "number" },
+    rationale: { type: "string" },
+  },
+  required: [
+    "item_keywords", "area", "service_type", "sort_by",
+    "max_price", "result_grain", "limit", "rationale",
+  ],
+  additionalProperties: false,
+};
+
+const SERVICE_TYPES = ["便當", "中式", "麵食", "飲料", "小吃", "日式", "其他", "甜點", "南洋", "西式"] as const;
+const SORTS = ["price_asc", "price_desc", "newest", "relevance"] as const;
+
+async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
+  const system = [
+    "You parse food-delivery search queries for a Taiwanese platform into JSON.",
+    "The platform's data is in Traditional Chinese. When the user uses English names for places or dishes, translate to the Taiwanese term. Examples: Da'an → 大安, Xinyi → 信義, Songshan → 松山, Neihu → 內湖, soup dumplings → 小籠包, lunchbox → 便當, bubble tea → 珍珠奶茶.",
+    `Service types available: ${SERVICE_TYPES.join(", ")}.`,
+    "If the query is about restaurants generally, leave item_keywords empty and set result_grain=\"shop\". If the query is about a specific dish, fill item_keywords and set result_grain=\"product\".",
+    "Rationale: a one-line Chinese summary of what you understood (e.g. \"大安最便宜的小籠包\").",
+    "limit defaults to 20.",
+    "Examples:",
+    'Q: cheapest soup dumplings in Da\'an district',
+    'A: {"item_keywords":["小籠包"],"area":"大安","service_type":null,"sort_by":"price_asc","max_price":null,"result_grain":"product","limit":20,"rationale":"大安最便宜的小籠包"}',
+    "Q: 便當 in 內湖 under 100",
+    'A: {"item_keywords":[],"area":"內湖","service_type":"便當","sort_by":"price_asc","max_price":100,"result_grain":"shop","limit":20,"rationale":"內湖區、100元以下的便當店"}',
+    "Q: 新開的飲料店",
+    'A: {"item_keywords":[],"area":null,"service_type":"飲料","sort_by":"newest","max_price":null,"result_grain":"shop","limit":20,"rationale":"最新加入的飲料店"}',
+    "Output only valid JSON.",
+  ].join("\n");
+
+  const res = await env.AI.run(
+    "@cf/meta/llama-3.1-8b-instruct" as keyof AiModels,
+    {
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: query },
+      ],
+      response_format: { type: "json_schema", json_schema: INTENT_SCHEMA },
+      max_tokens: 400,
+    } as never,
+  ) as unknown as { response?: unknown };
+
+  const raw = res?.response;
+  const obj = typeof raw === "string" ? JSON.parse(raw) : (raw as Record<string, unknown> | undefined);
+  if (!obj || typeof obj !== "object") throw new Error("model returned no JSON");
+
+  const sort = (SORTS as readonly string[]).includes(obj.sort_by as string)
+    ? (obj.sort_by as ParsedIntent["sort_by"])
+    : "relevance";
+  const grain = obj.result_grain === "product" ? "product" : "shop";
+  const items = Array.isArray(obj.item_keywords)
+    ? obj.item_keywords.filter((s: unknown): s is string => typeof s === "string" && s.length > 0)
+    : [];
+  return {
+    item_keywords: items,
+    area: typeof obj.area === "string" && obj.area.length > 0 ? obj.area : null,
+    service_type: typeof obj.service_type === "string" && obj.service_type.length > 0 ? obj.service_type : null,
+    sort_by: sort,
+    max_price: typeof obj.max_price === "number" && isFinite(obj.max_price) ? obj.max_price : null,
+    result_grain: grain,
+    limit: Math.min(Math.max(typeof obj.limit === "number" ? obj.limit : 20, 1), 50),
+    rationale: typeof obj.rationale === "string" ? obj.rationale : "",
+  };
+}
+
+type ProductRow = {
+  shop_id: number;
+  shop_name: string;
+  address: string | null;
+  tel_no: string | null;
+  category: string | null;
+  product: string | null;
+  image_thumbnail_url: string | null;
+  price: number | null;
+};
+
+async function runProductSearch(db: D1Database, intent: ParsedIntent): Promise<ProductRow[]> {
+  const kws = intent.item_keywords.slice(0, 5);
+  if (!kws.length) return [];
+
+  const bindings: unknown[] = [];
+  const likeClauses: string[] = [];
+  for (const k of kws) {
+    bindings.push(`%${k}%`);
+    likeClauses.push(`p.name LIKE ?${bindings.length}`);
+  }
+  const filters: string[] = [`(${likeClauses.join(" OR ")})`];
+
+  if (intent.area) {
+    bindings.push(intent.area);
+    filters.push(`EXISTS (SELECT 1 FROM shop_sent_areas a WHERE a.shop_id = s.id AND a.area = ?${bindings.length})`);
+  }
+  if (intent.service_type) {
+    bindings.push(intent.service_type);
+    filters.push(`EXISTS (SELECT 1 FROM shop_service_types t WHERE t.shop_id = s.id AND t.service_type = ?${bindings.length})`);
+  }
+  if (intent.max_price !== null) {
+    bindings.push(intent.max_price);
+    filters.push(`v.price <= ?${bindings.length}`);
+  }
+
+  let orderBy = "s.last_modified_date DESC";
+  if (intent.sort_by === "price_asc") orderBy = "(v.price IS NULL), v.price ASC";
+  else if (intent.sort_by === "price_desc") orderBy = "(v.price IS NULL), v.price DESC";
+  // newest / relevance → date desc (current default)
+
+  const sql = `
+    SELECT s.id AS shop_id, s.name AS shop_name, s.address, s.tel_no,
+           c.name AS category, p.name AS product, p.image_thumbnail_url, v.price
+    FROM products p
+    JOIN categories c ON c.id = p.category_id
+    JOIN shops      s ON s.id = c.shop_id
+    LEFT JOIN variations v ON v.product_id = p.id
+    WHERE ${filters.join(" AND ")}
+    ORDER BY ${orderBy}
+    LIMIT ${intent.limit}
+  `;
+  const r = await db.prepare(sql).bind(...bindings).all<ProductRow>();
+  return r.results ?? [];
+}
+
+type ShopRow = {
+  id: number;
+  name: string;
+  address: string | null;
+  tel_no: string | null;
+  owner_name: string | null;
+  last_modified_date: string | null;
+  img_count: number;
+};
+
+async function runShopSearch(db: D1Database, intent: ParsedIntent): Promise<ShopRow[]> {
+  const bindings: unknown[] = [];
+  const filters: string[] = [];
+
+  if (intent.area) {
+    bindings.push(intent.area);
+    filters.push(`EXISTS (SELECT 1 FROM shop_sent_areas a WHERE a.shop_id = s.id AND a.area = ?${bindings.length})`);
+  }
+  if (intent.service_type) {
+    bindings.push(intent.service_type);
+    filters.push(`EXISTS (SELECT 1 FROM shop_service_types t WHERE t.shop_id = s.id AND t.service_type = ?${bindings.length})`);
+  }
+  // Keywords on shop grain: match name or address (OR-of-keywords, each keyword OR-of-fields).
+  if (intent.item_keywords.length) {
+    const parts: string[] = [];
+    for (const k of intent.item_keywords.slice(0, 5)) {
+      bindings.push(`%${k}%`);
+      parts.push(`s.name LIKE ?${bindings.length}`);
+      bindings.push(`%${k}%`);
+      parts.push(`s.address LIKE ?${bindings.length}`);
+    }
+    filters.push(`(${parts.join(" OR ")})`);
+  }
+
+  // Refuse a totally unconstrained query (would just dump latest).
+  // If everything is null/empty, fall back to "newest" tour at small limit.
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const orderBy = "s.last_modified_date DESC";
+
+  const sql = `
+    SELECT s.id, s.name, s.address, s.tel_no, s.owner_name, s.last_modified_date,
+           COALESCE((SELECT COUNT(*) FROM products p JOIN categories c ON c.id = p.category_id
+                     WHERE c.shop_id = s.id AND p.image_url IS NOT NULL), 0) AS img_count
+    FROM shops s
+    ${where}
+    ORDER BY ${orderBy}
+    LIMIT ${intent.limit}
+  `;
+  const r = await db.prepare(sql).bind(...bindings).all<ShopRow>();
+  return r.results ?? [];
+}
+
+function askFormHtml(q: string): string {
+  return /* html */ `
+    <p><a href="/" class="back">← 結構化搜尋</a></p>
+    <form action="/ask" method="get" class="ask-page">
+      <input type="search" name="q" value="${escapeHtml(q)}" placeholder="例：cheapest 便當 in 內湖" autofocus />
+      <button type="submit">問</button>
+    </form>
+  `;
+}
+
+function intentBlockHtml(intent: ParsedIntent): string {
+  const chips: string[] = [];
+  if (intent.item_keywords.length) chips.push("關鍵字: " + intent.item_keywords.join(", "));
+  if (intent.area) chips.push("地區: " + intent.area);
+  if (intent.service_type) chips.push("類型: " + intent.service_type);
+  if (intent.max_price !== null) chips.push("≤ $" + intent.max_price);
+  if (intent.sort_by === "price_asc") chips.push("最便宜");
+  else if (intent.sort_by === "price_desc") chips.push("最貴");
+  else if (intent.sort_by === "newest") chips.push("最新");
+  return /* html */ `
+    <div class="intent">
+      <div><span class="label">✨ 理解為：</span><strong>${escapeHtml(intent.rationale || "(沒有 rationale)")}</strong></div>
+      ${chips.length ? `<div class="chips">${chips.map(c => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div>` : ""}
+    </div>
+  `;
+}
+
+function productRowHtml(r: ProductRow): string {
+  const thumb = r.image_thumbnail_url
+    ? `<img class="thumb" loading="lazy" src="https://dinbendon.net${escapeAttr(r.image_thumbnail_url)}" alt="" />`
+    : `<span class="thumb thumb-empty"></span>`;
+  return /* html */ `
+    <li class="product">
+      ${thumb}
+      <div class="pinfo">
+        <div class="pname">${escapeHtml(r.product ?? "—")}</div>
+        <div class="pmeta">
+          <a href="/shop/${r.shop_id}">${escapeHtml(r.shop_name)}</a>
+          ${r.category ? ` · ${escapeHtml(r.category)}` : ""}
+        </div>
+        ${r.address ? `<div class="paddr">${escapeHtml(r.address)}</div>` : ""}
+      </div>
+      <div class="pprice">${r.price != null ? `$${r.price}` : ""}</div>
+    </li>
+  `;
+}
+
+async function renderAsk(env: Env, url: URL): Promise<Response> {
+  const q = (url.searchParams.get("q") ?? "").trim();
+
+  if (!q) {
+    return html(layout("AI 搜尋", askFormHtml("") + `<p class="meta">輸入一句話開始 — 例如「cheapest 便當 in 內湖」「最新的飲料店」「最便宜的小籠包」。</p>`));
+  }
+
+  let intent: ParsedIntent;
+  try {
+    intent = await parseIntent(env, q);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return html(layout("AI 搜尋", askFormHtml(q) + `
+      <p class="empty">⚠️ AI 解析失敗：${escapeHtml(msg)}</p>
+      <p><a href="/">改用手動搜尋 →</a></p>
+    `));
+  }
+
+  let resultsHtml: string;
+  if (intent.result_grain === "product") {
+    const rows = await runProductSearch(env.DB, intent);
+    resultsHtml = rows.length
+      ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
+      : `<p class="empty">沒有符合的菜單項目。試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+  } else {
+    const rows = await runShopSearch(env.DB, intent);
+    resultsHtml = rows.length
+      ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
+      : `<p class="empty">沒有符合的店家。試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+  }
+
+  return html(layout("AI 搜尋: " + q, askFormHtml(q) + intentBlockHtml(intent) + resultsHtml));
+}
+
 async function renderHealth(env: Env): Promise<Response> {
   const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM shops`).first<{ n: number }>();
   return new Response(JSON.stringify({ ok: true, shops: r?.n ?? 0 }), {
@@ -326,6 +613,38 @@ function layout(title: string, body: string): string {
   form.search input { flex: 1 1 14rem; padding: .55rem .7rem; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
   form.search input[name="area"] { flex: 0 1 14rem; }
   form.search button { padding: .55rem 1rem; border: 0; border-radius: 6px; background: #0a66c2; color: white; font-size: 1rem; cursor: pointer; }
+  form.ask-on-home { background: linear-gradient(135deg, #eef5ff, #f3eeff); border: 1px solid #d6e2f5; border-radius: 10px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
+  form.ask-on-home label { font-weight: 600; display: block; margin-bottom: .5rem; }
+  form.ask-on-home .ask-row { display: flex; gap: .5rem; }
+  form.ask-on-home input { flex: 1; padding: .55rem .7rem; border: 1px solid #c8d6ed; border-radius: 6px; font-size: 1rem; background: white; }
+  form.ask-on-home button { padding: .55rem 1.1rem; border: 0; border-radius: 6px; background: #6a3aff; color: white; font-size: 1rem; cursor: pointer; }
+  form.ask-on-home .hint { color: #666; font-size: .85em; margin: .5rem 0 0; }
+  form.ask-page { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  form.ask-page input { flex: 1; padding: .55rem .7rem; border: 1px solid #c8d6ed; border-radius: 6px; font-size: 1rem; }
+  form.ask-page button { padding: .55rem 1.1rem; border: 0; border-radius: 6px; background: #6a3aff; color: white; font-size: 1rem; cursor: pointer; }
+  .intent { background: #fafbfd; border: 1px solid #e6e9ef; border-radius: 8px; padding: .65rem .85rem; margin: .6rem 0 1rem; }
+  .intent .label { color: #6a3aff; font-weight: 600; margin-right: .3em; }
+  .intent .chips { margin-top: .35rem; display: flex; flex-wrap: wrap; gap: .35rem; }
+  .intent .chip { background: #ece5ff; color: #4a2ab8; padding: .12em .55em; border-radius: 4px; font-size: .82em; }
+  ul.results.products li.product { display: grid; grid-template-columns: 56px 1fr auto; gap: .7rem; align-items: center; padding: .6rem 0; border-bottom: 1px solid color-mix(in srgb, currentColor 8%, transparent); }
+  ul.results.products .thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #eee; }
+  ul.results.products .thumb-empty { display: inline-block; background: #f0f0f4; }
+  ul.results.products .pname { font-weight: 600; }
+  ul.results.products .pmeta { color: #555; font-size: .9em; margin-top: .15em; }
+  ul.results.products .paddr { color: #888; font-size: .82em; }
+  ul.results.products .pprice { font-weight: 700; color: #0a66c2; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  @media (prefers-color-scheme: dark) {
+    form.ask-on-home { background: linear-gradient(135deg, #1a2235, #251c3a); border-color: #2e3346; }
+    form.ask-on-home input { background: #0c0d11; color: inherit; border-color: #2e3346; }
+    form.ask-on-home .hint { color: #aab2c0; }
+    .intent { background: #181c25; border-color: #2a2c33; }
+    .intent .chip { background: #2d2552; color: #c6b6ff; }
+    .intent .label { color: #c6b6ff; }
+    ul.results.products .thumb-empty { background: #20242d; }
+    ul.results.products .pmeta { color: #b0b7c5; }
+    ul.results.products .paddr { color: #8a93a6; }
+    ul.results.products .pprice { color: #7eb6ff; }
+  }
   .meta { color: #666; font-size: .92em; }
   .empty { color: #888; padding: 2em 0; text-align: center; }
   ul.results { list-style: none; padding: 0; margin: 0; }

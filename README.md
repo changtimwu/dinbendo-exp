@@ -69,6 +69,42 @@ For dataset-level findings from the first full sweep — id density,
 service type / delivery area breakdowns, image coverage, ownership
 concentration — see [`stats.md`](stats.md).
 
+## Live site
+
+The dataset is browsable at **<https://dinbendon.itsi.xyz>** — a small
+Cloudflare Worker (in [`worker/`](worker/)) backed by a D1 database.
+
+- `/` — structured search by name/address and delivery area, plus a
+  natural-language search box at the top.
+- `/ask?q=…` — natural-language search. Cloudflare Workers AI parses
+  the query into a structured intent (item keywords, area, service
+  type, price ceiling, sort) and the worker runs a parameterized D1
+  query. Translates English place / dish names (Da'an → 大安, soup
+  dumplings → 小籠包). The parsed intent is shown above the results
+  for transparency.
+- `/shop/:id` — shop detail with menu, auto-labeling its image gallery
+  as 菜單照片 or 產品照片 using the heuristic from [`stats.md`](stats.md).
+- `/healthz` — JSON sanity check.
+
+Sample NL queries:
+
+```
+/ask?q=cheapest soup dumplings in Da'an district
+/ask?q=便當 in 內湖 under 100
+/ask?q=新開的飲料店
+```
+
+Deploy:
+
+```bash
+cd worker
+npm install
+CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… npx wrangler deploy
+```
+
+`wrangler.jsonc` declares both bindings (`DB` → D1, `AI` → Workers AI),
+plus the custom domain.
+
 ## Compacting `scanned.jsonl`
 
 `scanned.jsonl` grows linearly (~30 bytes per id). For analysis or
