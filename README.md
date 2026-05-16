@@ -32,6 +32,19 @@ So valid ids appear scattered up to at least the mid-600k range. Start with a sm
 window (`--start 600000 --end 640000`) to estimate density before launching a full
 sweep.
 
+## Incremental updates from the latest-shops feed
+
+Once you've done a full sweep, use `update_from_feed.py` to pick up newly added
+shops without re-scanning everything:
+
+```bash
+python update_from_feed.py
+```
+
+It fetches `https://dinbendon.net/feed/latestshops` (Atom XML, ~20 recent
+entries), filters to ids not already present in `shops.jsonl` or
+`scanned.jsonl`, and merges new hits in. Safe to run on a cron.
+
 ## Output shape
 
 `shops.jsonl`:
