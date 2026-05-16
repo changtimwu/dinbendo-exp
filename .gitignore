@@ -6,3 +6,4 @@ venv/
 # scraper output
 shops.jsonl
 scanned.jsonl
+shops.sqlite

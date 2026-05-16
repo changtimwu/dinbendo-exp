@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from shops_db import ensure_schema, open_db, upsert_shop
+
 FEED_URL = "https://dinbendon.net/feed/latestshops"
 DETAIL_URL = "https://dinbendon.net/mvc/api/shop/idine/detail"
 
@@ -77,6 +79,11 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=15.0, help="per-request timeout, seconds")
     ap.add_argument("--delay", type=float, default=0.2,
                     help="sleep between detail fetches, seconds")
+    ap.add_argument("--db", type=Path, default=Path("shops.sqlite"),
+                    help="SQLite database to upsert new shops into (created if missing). "
+                         "Pass --no-db to disable.")
+    ap.add_argument("--no-db", dest="db", action="store_const", const=None,
+                    help="don't write to a SQLite database")
     args = ap.parse_args()
 
     session = requests.Session()
@@ -100,34 +107,48 @@ def main() -> int:
         print("[done] nothing to merge", flush=True)
         return 0
 
+    db_con = None
+    if args.db is not None:
+        db_con = open_db(args.db)
+        ensure_schema(db_con)
+        print(f"[db] {args.db} ready", flush=True)
+
     added = 0
     misses = 0
     errs = 0
-    with args.out.open("a", encoding="utf-8") as out_f, \
-         args.progress.open("a", encoding="utf-8") as prog_f:
-        for i, sid in enumerate(new_ids):
-            if i and args.delay > 0:
-                time.sleep(args.delay)
-            data, err = fetch_shop(session, sid, args.timeout)
-            if err is not None:
-                errs += 1
-                prog_f.write(json.dumps({"shopId": sid, "err": err}, ensure_ascii=False) + "\n")
-                print(f"  [{sid}] err: {err}", flush=True)
-                continue
-            if data is None:
-                misses += 1
-                prog_f.write(json.dumps({"shopId": sid, "hit": False}, ensure_ascii=False) + "\n")
-                print(f"  [{sid}] miss (data:null)", flush=True)
-                continue
-            added += 1
-            out_f.write(json.dumps({"shopId": sid, "data": data}, ensure_ascii=False) + "\n")
-            prog_f.write(json.dumps({"shopId": sid, "hit": True}, ensure_ascii=False) + "\n")
-            name = (data.get("detail") or {}).get("name", "?")
-            print(f"  [{sid}] + {name}", flush=True)
-        out_f.flush()
-        prog_f.flush()
+    try:
+        with args.out.open("a", encoding="utf-8") as out_f, \
+             args.progress.open("a", encoding="utf-8") as prog_f:
+            for i, sid in enumerate(new_ids):
+                if i and args.delay > 0:
+                    time.sleep(args.delay)
+                data, err = fetch_shop(session, sid, args.timeout)
+                if err is not None:
+                    errs += 1
+                    prog_f.write(json.dumps({"shopId": sid, "err": err}, ensure_ascii=False) + "\n")
+                    print(f"  [{sid}] err: {err}", flush=True)
+                    continue
+                if data is None:
+                    misses += 1
+                    prog_f.write(json.dumps({"shopId": sid, "hit": False}, ensure_ascii=False) + "\n")
+                    print(f"  [{sid}] miss (data:null)", flush=True)
+                    continue
+                added += 1
+                out_f.write(json.dumps({"shopId": sid, "data": data}, ensure_ascii=False) + "\n")
+                prog_f.write(json.dumps({"shopId": sid, "hit": True}, ensure_ascii=False) + "\n")
+                if db_con is not None:
+                    upsert_shop(db_con, sid, data)
+                    db_con.commit()
+                name = (data.get("detail") or {}).get("name", "?")
+                print(f"  [{sid}] + {name}", flush=True)
+            out_f.flush()
+            prog_f.flush()
+    finally:
+        if db_con is not None:
+            db_con.close()
 
-    print(f"[done] added={added} miss={misses} err={errs}", flush=True)
+    print(f"[done] added={added} miss={misses} err={errs}"
+          + (f"  db={args.db}" if args.db is not None else ""), flush=True)
     return 0
 
 

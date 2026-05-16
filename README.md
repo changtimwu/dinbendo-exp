@@ -43,7 +43,40 @@ python update_from_feed.py
 
 It fetches `https://dinbendon.net/feed/latestshops` (Atom XML, ~20 recent
 entries), filters to ids not already present in `shops.jsonl` or
-`scanned.jsonl`, and merges new hits in. Safe to run on a cron.
+`scanned.jsonl`, and merges new hits into both `shops.jsonl` and
+`shops.sqlite`. Pass `--no-db` to skip the SQLite write, or
+`--db path/to/other.sqlite` to point at a different file. Safe to run on
+a cron.
+
+## Loading into SQLite
+
+`to_sqlite.py` flattens `shops.jsonl` into a normalized database
+(`shops.sqlite` by default):
+
+```bash
+python to_sqlite.py
+```
+
+It drops and recreates every table, so it's the right tool after a
+fresh full sweep. For incremental keep-it-current updates, use
+`update_from_feed.py` (which writes to the same DB).
+
+The schema (six tables, FK cascades, indexes) and an ER diagram live in
+[`schema.md`](schema.md). The shared schema + per-shop upsert helper is
+in [`shops_db.py`](shops_db.py).
+
+## Compacting `scanned.jsonl`
+
+`scanned.jsonl` grows linearly (~30 bytes per id). For analysis or
+sharing, collapse it to a sorted range list:
+
+```bash
+python to_ranges.py
+```
+
+That produces `scanned_ranges.json`, which is typically 5-6 orders of
+magnitude smaller (`{"scanned": [[1, 650000]], "errors": [...], ...}`).
+The scrapers still read/write `scanned.jsonl` for resume.
 
 ## Output shape
 
