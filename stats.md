@@ -1,0 +1,195 @@
+# dinbendon dataset statistics
+
+Snapshot taken 2026-05-16/17 from a full brute-force sweep of shop ids
+1..650,000 against `https://dinbendon.net/mvc/api/shop/idine/detail`.
+
+Reproduce these from [`shops.sqlite`](schema.md):
+
+```bash
+python scrape_shops.py --start 1 --end 650000
+python to_sqlite.py
+sqlite3 shops.sqlite
+```
+
+## Coverage
+
+| | |
+|---|---:|
+| Shop ids scanned | 650,000 |
+| Valid shops found | 13,051 |
+| Overall hit density | 2.0% |
+| Errors during scan | 0 |
+| Wall time | ~50 min |
+
+The populated id space is effectively `1..637,475`. No ids past that
+return data — the allocator pointer was near 637,500 as of 2026-05-15
+(seen in the latest-shops feed).
+
+## ID density rises monotonically with id
+
+Newer shops are denser; old low-id slots are sparse from years of
+churn / deletion.
+
+| Range | Hits | Density |
+|---|---:|---:|
+| 0 – 99,999 | 705 | 0.7% |
+| 100k – 199,999 | 861 | 0.9% |
+| 200k – 299,999 | 1,168 | 1.2% |
+| 300k – 399,999 | 1,797 | 1.8% |
+| 400k – 499,999 | 2,688 | 2.7% |
+| 500k – 599,999 | 4,195 | 4.2% |
+| 600k – 637,475 | 1,637 | 4.4% |
+| 640k – 650,000 | 0 | 0% (allocator hasn't reached) |
+
+## What's in a shop
+
+| Object | Total | Avg per shop |
+|---|---:|---:|
+| categories | 57,054 | 4.4 |
+| products | 433,804 | 33.2 |
+| variations | 607,135 | 46.5 |
+
+## Top service types
+
+By number of shops carrying the tag:
+
+| Type | Shops |
+|---|---:|
+| 便當 (lunchbox) | 5,939 |
+| 中式 (Chinese) | 3,830 |
+| 麵食 (noodles) | 3,626 |
+| 飲料 (drinks) | 3,192 |
+| 小吃 (snacks) | 2,012 |
+| 日式 (Japanese) | 948 |
+| 其他 (other) | 854 |
+| 甜點 (dessert) | 690 |
+| 南洋 (SE Asian) | 616 |
+| 西式 (Western) | 420 |
+
+23,583 (shop, type) pairs total — about 1.8 service tags per shop on average.
+
+## Delivery areas
+
+The `sentAreas` field is a list of free-form Chinese substrings that
+the platform pre-decomposes for search (e.g. `台北市` is also listed as
+`台`, `北`, `市`, `台北`, `北市`). That's why the top entries are
+single characters:
+
+| Area | Shops |
+|---|---:|
+| 市 | 5,341 |
+| 區 | 3,860 |
+| 台 | 2,847 |
+| 台北市 | 2,211 |
+| 北 | 2,181 |
+| 台中市 | 2,168 |
+| 北市 | 2,007 |
+| 中 | 1,765 |
+| 台中 | 1,625 |
+| 台北 | 1,373 |
+
+For meaningful geographic analysis, filter to multi-character entries
+or de-dupe via `lat`/`lng` instead.
+
+## Images
+
+The API exposes images at exactly one level: **`product.image`**, which
+flattens into `products.image_url` and `products.image_thumbnail_url`.
+
+> The API has **no menu-banner field** at the shop or category level.
+> The site may render a "menu image" view by composing the per-product
+> photos, but no separate menu image is delivered by
+> `/mvc/api/shop/idine/detail`. If you spot one served from a different
+> endpoint, it'd need its own scraper.
+
+### Shops with at least one product image
+
+| | Shops | % of all shops |
+|---|---:|---:|
+| Any product has an image | **1,510** | **11.6%** |
+| Every product is text-only | 11,541 | 88.4% |
+
+### Distribution by image count
+
+| Images on shop | Shops |
+|---|---:|
+| 0 | 11,541 |
+| 1 – 2 | 1,104 |
+| 3 – 5 | 139 |
+| 6 – 10 | 144 |
+| 11 – 30 | 95 |
+| 31+ | 28 |
+
+Long tail: a small minority of shops carry the bulk of the photos.
+
+### Top 10 shops by product image count
+
+| shopId | Name | Images | Total products |
+|---:|---|---:|---:|
+| 189455 | 垂坤食品 | 221 | 254 |
+| 627134 | 得倫食品<<一片珍情海苔>> | 217 | 219 |
+| 374135 | 垂坤肉鬆店(新版) | 166 | 169 |
+| 119082 | 得倫食品~一片珍情海苔 | 129 | 196 |
+| 380172 | 得倫食品（一片珍情海苔） | 98 | 164 |
+| 384054 | 散裝零食餅乾 | 63 | 65 |
+| 76291 | 苗栗苑里 - 垂坤肉鬆 | 60 | 152 |
+| 128551 | 宏裕行_高雄店 | 60 | 68 |
+| 154249 | 麵包部落 | 58 | 67 |
+| 256956 | 魷品味 | 58 | 59 |
+
+The image-rich cluster is overwhelmingly **packaged-food / dried-goods
+chains** (垂坤, 得倫, 宏裕行) where every SKU gets a photo. Lunchbox /
+takeout shops — the platform's bread and butter — are almost entirely
+text-only menus.
+
+### Fetching an image
+
+The URLs are relative; prefix with the site origin to fetch:
+
+```
+https://dinbendon.net + products.image_url
+https://dinbendon.net + products.image_thumbnail_url
+```
+
+## Ownership
+
+| | |
+|---|---:|
+| Distinct owner_name values | 4,189 |
+| Avg shops per owner | 3.1 |
+
+Top 5 owners by shop count:
+
+| owner_name | shops |
+|---|---:|
+| d3001309(esunhsinchu) | 148 |
+| gtt | 139 |
+| ifood | 121 |
+| MOMODA | 101 |
+| Phison5F | 93 |
+
+These look like enterprise / cafeteria accounts that maintain catalogues
+for many vendors (the names hint at corporate / building managers).
+
+## Duplicate shop names
+
+Chain restaurants are not deduplicated — every site listing is a
+separate `shopId`:
+
+| Name | Distinct ids |
+|---|---:|
+| 八方雲集 | 17 |
+| 正忠排骨飯 | 6 |
+| 一沐日 | 5 |
+| 吉野烤肉飯 | 5 |
+| 梁社漢排骨 | 5 |
+| 傑克廚房 | 4 |
+| 吾家味涼麵 | 4 |
+| 天仁茗茶 | 4 |
+| 嶼魚廚房 | 4 |
+| 御香亭 | 4 |
+
+This matters when summarising "how many shops on the platform" — the
+real count of *distinct businesses* is somewhat lower, since 4 separate
+"得倫食品" entries and 17 "八方雲集" entries are the same chains
+re-registered by different orderers.

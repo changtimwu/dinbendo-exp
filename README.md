@@ -65,6 +65,10 @@ The schema (six tables, FK cascades, indexes) and an ER diagram live in
 [`schema.md`](schema.md). The shared schema + per-shop upsert helper is
 in [`shops_db.py`](shops_db.py).
 
+For dataset-level findings from the first full sweep — id density,
+service type / delivery area breakdowns, image coverage, ownership
+concentration — see [`stats.md`](stats.md).
+
 ## Compacting `scanned.jsonl`
 
 `scanned.jsonl` grows linearly (~30 bytes per id). For analysis or
