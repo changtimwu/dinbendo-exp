@@ -7,3 +7,11 @@ venv/
 shops.jsonl
 scanned.jsonl
 shops.sqlite
+
+# d1 import artifacts
+shops.sql
+shops_d1.sql
+
+# secrets
+cftoken.env
+*.env
