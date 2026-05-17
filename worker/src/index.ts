@@ -308,7 +308,7 @@ const INTENT_SCHEMA = {
 };
 
 const PROXIMITY_RADIUS_KM = 1.5;
-const NL_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+const NL_MODEL = "@cf/openai/gpt-oss-20b";
 const NOMINATIM_UA = "dinbendon.itsi.xyz (https://dinbendon.itsi.xyz; https://github.com/changtimwu/dinbendo-exp)";
 
 const SERVICE_TYPES = ["便當", "中式", "麵食", "飲料", "小吃", "日式", "其他", "甜點", "南洋", "西式"] as const;
@@ -321,7 +321,7 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
     `Service types available: ${SERVICE_TYPES.join(", ")}.`,
     "Fields:",
     "  area:           a Taipei-area district / city name from the delivery list (e.g. 大安, 內湖, 台北市). Use ONLY for broad districts. Leave null if the user named something more specific (an MRT station, building, road, university, etc.).",
-    "  near_landmark:  a specific landmark string suitable for geocoding (e.g. \"古亭站\", \"台北車站\", \"台灣大學\", \"信義誠品\", \"101\"). Use whenever the user mentions a station, building, university, road, or other point of interest — even if you also recognize a containing district.",
+    "  near_landmark:  a specific landmark string suitable for geocoding (e.g. \"古亭站\", \"台北車站\", \"台灣大學\", \"信義誠品\", \"台北101\"). Use whenever the user mentions a station, building, university, road, or other point of interest — even if you also recognize a containing district. ALWAYS preserve city qualifiers — \"Taipei 101\" → \"台北101\" (not just \"101\"), \"Taipei Main Station\" → \"台北車站\", \"Taipei Zoo\" → \"台北市立動物園\". Stations: append \"站\" if missing (\"Songshan\" → \"松山車站\" or \"松山火車站\"; if the user says \"MRT\" or \"捷運\" use \"捷運XX站\").",
     "  item_keywords:  dish names (e.g. \"炒飯\", \"小籠包\"). Empty for restaurant-level queries.",
     "  result_grain:   \"product\" if a specific dish is named, otherwise \"shop\".",
     "  rationale:      one-line Chinese summary of what you understood (e.g. \"大安最便宜的小籠包\").",
@@ -334,6 +334,8 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
     'A: {"item_keywords":["炒飯"],"area":null,"near_landmark":"古亭站","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"古亭站附近的炒飯"}',
     "Q: fried rice near Taipei Main Station",
     'A: {"item_keywords":["炒飯"],"area":null,"near_landmark":"台北車站","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"台北車站附近的炒飯"}',
+    "Q: coffee near Taipei 101",
+    'A: {"item_keywords":["咖啡"],"area":null,"near_landmark":"台北101","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"台北101附近的咖啡"}',
     "Q: 便當 in 內湖 under 100",
     'A: {"item_keywords":[],"area":"內湖","near_landmark":null,"service_type":"便當","sort_by":"price_asc","max_price":100,"result_grain":"shop","limit":20,"rationale":"內湖區、100元以下的便當店"}',
     "Q: 新開的飲料店",

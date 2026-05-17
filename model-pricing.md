@@ -1,7 +1,7 @@
 # Workers AI model choice & pricing
 
 Snapshot date: 2026-05-17. Current model on `dinbendon.itsi.xyz`:
-**`@cf/google/gemma-4-26b-a4b-it`**.
+**`@cf/openai/gpt-oss-20b`**.
 
 ## Billing model
 
@@ -23,37 +23,43 @@ curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
 
 The intent-parsing prompt is about **500 input tokens + 200 output
 tokens** per natural-language query (`/ask`). For our chosen model
-`@cf/google/gemma-4-26b-a4b-it` ($0.10 / M input · $0.30 / M output):
+`@cf/openai/gpt-oss-20b` ($0.20 / M input · $0.30 / M output):
 
 ```
-cost / query ≈ 500/1M * 0.10  +  200/1M * 0.30
-            ≈ $0.00005 + $0.00006
-            ≈ $0.00011  (~$1.10 per 10,000 queries)
+cost / query ≈ 500/1M * 0.20  +  200/1M * 0.30
+            ≈ $0.00010 + $0.00006
+            ≈ $0.00016  (~$1.60 per 10,000 queries)
 ```
 
-In neuron terms that's roughly **10 neurons / query**, so the free
-10K-neuron daily budget covers about **1,000 NL queries / day** before
+In neuron terms that's roughly **15 neurons / query**, so the free
+10K-neuron daily budget covers about **650 NL queries / day** before
 any billing kicks in.
 
 ## Choice rationale
 
-**Why `@cf/google/gemma-4-26b-a4b-it`** over the previous
-`@cf/meta/llama-3.1-8b-instruct`:
+We landed on `@cf/openai/gpt-oss-20b` after two iterations:
 
-- *Cheaper per query.* Input is $0.10 vs $0.152 (the 8B fp8 variant).
-  Output is $0.30 vs $0.287 — slightly higher, but smaller share.
-- *Bigger context.* 256K tokens vs 32K; lets the system prompt grow with
-  more few-shot examples without crowding the user query.
-- *Tool/function-calling support.* Sets us up to upgrade from raw JSON
-  parsing to proper tool-calling later without changing models.
-- *Modern model.* Released after the Llama 3.1 family; better
-  multilingual instruction-following matters for English↔Chinese
-  blended queries on a Taiwanese dataset.
+1. **`@cf/meta/llama-3.1-8b-instruct` (initial)** — fine quality on simple
+   queries, 5-8 second responses. Acceptable but slow-feeling.
+2. **`@cf/google/gemma-4-26b-a4b-it` (briefly)** — picked for cheaper
+   input and tool support. Turned out to be a *reasoning* model that
+   emits a long chain-of-thought before the JSON. End-to-end response
+   ballooned to 10-13 seconds because inference time scales with output
+   tokens. (See the `parseIntent` timing in `/ask` responses.)
+3. **`@cf/openai/gpt-oss-20b` (current)** — non-reasoning, comparable
+   capability, tool support, ~1.5 second parse times. Slightly higher
+   input cost than Gemma 4 26b but no wasted reasoning tokens, so total
+   cost per query is similar and latency is 5-9× better.
 
-The 70B-class models (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
-`@cf/openai/gpt-oss-120b`) are smarter on ambiguous prompts but 3-7×
-more expensive at our token shape. Worth swapping in only if specific
-queries start parsing wrong.
+Quality note: gpt-oss-20b is less robust at English → Taiwanese place
+translation than Gemma 4 26b, so the system prompt now spells out
+explicit examples like "Taipei 101 → 台北101" rather than relying on
+the model's geographic knowledge.
+
+For tricky parses that gpt-oss-20b still misses, swap to
+`@cf/openai/gpt-oss-120b` ($0.35/$0.75) or
+`@cf/meta/llama-3.3-70b-instruct-fp8-fast` ($0.293/$2.253) — 2-4× more
+expensive but worth it on ambiguous prompts.
 
 ## Full Workers AI text-generation catalog at a glance
 
@@ -72,9 +78,9 @@ queries start parsing wrong.
 
 | Model | $/M input | $/M output | Context | Tools |
 |---|---:|---:|---:|:---:|
-| **`@cf/google/gemma-4-26b-a4b-it`** *(current)* | **0.10** | 0.30 | 256K | ✓ |
+| `@cf/google/gemma-4-26b-a4b-it` | **0.10** | 0.30 | 256K | ✓ |
 | `@cf/qwen/qwen3-30b-a3b-fp8` | 0.051 | 0.335 | 32K | ✓ |
-| `@cf/openai/gpt-oss-20b` | 0.20 | 0.30 | 128K | ✓ |
+| **`@cf/openai/gpt-oss-20b`** *(current)* | 0.20 | 0.30 | 128K | ✓ |
 | `@cf/meta/llama-4-scout-17b-16e-instruct` | 0.27 | 0.85 | 131K | ✓ |
 | `@cf/google/gemma-3-12b-it` | 0.345 | 0.556 | 80K | — |
 | `@cf/mistralai/mistral-small-3.1-24b-instruct` | 0.351 | 0.555 | 128K | ✓ |
