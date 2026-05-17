@@ -15,6 +15,20 @@ export interface Env {
 const SITE_TITLE = "DinBenDon Browser";
 const SOURCE_URL = "https://github.com/changtimwu/dinbendo-exp";
 
+// Surfaced as clickable chips on the home page so users see the
+// shape of natural-language queries the worker understands. Each
+// `why` is the hover tooltip — keep it short.
+const ASK_EXAMPLES: { q: string; why: string }[] = [
+  { q: "古亭站附近的炒飯",            why: "MRT 站附近 1.5 km" },
+  { q: "fried rice near Taipei 101",   why: "English place + dish, auto-translated" },
+  { q: "便當 in 內湖 under 100",       why: "服務類型 + 地區 + 價格上限" },
+  { q: "最便宜的小籠包",               why: "依菜色排序" },
+  { q: "新開的飲料店",                 why: "依更新時間排序" },
+  { q: "coffee near 台灣大學",         why: "校園附近" },
+  { q: "cheapest 便當 in 信義",        why: "中英混合也行" },
+  { q: "台北車站附近的拉麵",            why: "車站定位" },
+];
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -93,7 +107,10 @@ async function renderSearch(env: Env, url: URL): Promise<Response> {
         <input type="search" name="q" placeholder="例：cheapest 便當 in 內湖" />
         <button type="submit">問</button>
       </div>
-      <p class="hint">用一句話描述你想找的東西 — 模型會幫你翻譯地名 (Da'an → 大安) 與菜色。</p>
+      <p class="hint">用一句話描述你想找的東西 — 模型會幫你翻譯地名 (Da'an → 大安) 與菜色，並對 MRT 站、地標附近 1.5 km 搜尋。</p>
+      <ul class="examples">
+        ${ASK_EXAMPLES.map(ex => `<li><a href="/ask?q=${encodeURIComponent(ex.q)}" title="${escapeAttr(ex.why)}">${escapeHtml(ex.q)}</a></li>`).join("")}
+      </ul>
     </form>
     <form action="/" method="get" class="search">
       <input type="search" name="q" value="${escapeHtml(q)}" placeholder="店名 / 地址" />
@@ -868,7 +885,11 @@ function layoutHead(title: string): string {
   form.ask-on-home .ask-row { display: flex; gap: .5rem; }
   form.ask-on-home input { flex: 1; padding: .55rem .7rem; border: 1px solid #c8d6ed; border-radius: 6px; font-size: 1rem; background: white; }
   form.ask-on-home button { padding: .55rem 1.1rem; border: 0; border-radius: 6px; background: #6a3aff; color: white; font-size: 1rem; cursor: pointer; }
-  form.ask-on-home .hint { color: #666; font-size: .85em; margin: .5rem 0 0; }
+  form.ask-on-home .hint { color: #666; font-size: .85em; margin: .5rem 0 .25rem; }
+  form.ask-on-home .examples { list-style: none; padding: 0; margin: .35rem 0 0; display: flex; flex-wrap: wrap; gap: .35rem; }
+  form.ask-on-home .examples li { margin: 0; }
+  form.ask-on-home .examples a { display: inline-block; background: rgba(255,255,255,.7); color: #4a2ab8; border: 1px solid #d5cbf7; padding: .15em .55em; border-radius: 999px; font-size: .82em; text-decoration: none; }
+  form.ask-on-home .examples a:hover { background: white; border-color: #6a3aff; }
   form.ask-page { display: flex; gap: .5rem; margin-bottom: 1rem; }
   form.ask-page input { flex: 1; padding: .55rem .7rem; border: 1px solid #c8d6ed; border-radius: 6px; font-size: 1rem; }
   form.ask-page button { padding: .55rem 1.1rem; border: 0; border-radius: 6px; background: #6a3aff; color: white; font-size: 1rem; cursor: pointer; }
@@ -906,6 +927,8 @@ function layoutHead(title: string): string {
     form.ask-on-home { background: linear-gradient(135deg, #1a2235, #251c3a); border-color: #2e3346; }
     form.ask-on-home input { background: #0c0d11; color: inherit; border-color: #2e3346; }
     form.ask-on-home .hint { color: #aab2c0; }
+    form.ask-on-home .examples a { background: rgba(15,16,24,.6); color: #c6b6ff; border-color: #3a2e63; }
+    form.ask-on-home .examples a:hover { background: #1a1b25; border-color: #6a3aff; }
     .intent { background: #181c25; border-color: #2a2c33; }
     .intent .chip { background: #2d2552; color: #c6b6ff; }
     .intent .label { color: #c6b6ff; }
