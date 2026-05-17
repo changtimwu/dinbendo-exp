@@ -308,7 +308,7 @@ const INTENT_SCHEMA = {
 };
 
 const PROXIMITY_RADIUS_KM = 1.5;
-const NL_MODEL = "@cf/openai/gpt-oss-20b";
+const NL_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const NOMINATIM_UA = "dinbendon.itsi.xyz (https://dinbendon.itsi.xyz; https://github.com/changtimwu/dinbendo-exp)";
 
 const SERVICE_TYPES = ["便當", "中式", "麵食", "飲料", "小吃", "日式", "其他", "甜點", "南洋", "西式"] as const;
@@ -352,9 +352,11 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
         { role: "user", content: query },
       ],
       response_format: { type: "json_schema", json_schema: INTENT_SCHEMA },
-      // Gemma 4 26b is a reasoning model; the response burns tokens on `reasoning`
-      // before emitting `content`. Give it room for both.
-      max_tokens: 2000,
+      // Gemma 4 26b is a reasoning model. reasoning_effort="none" suppresses
+      // the chain-of-thought trace so we get the JSON directly and parse
+      // latency drops from ~10s to ~1-2s. Valid: "none" | "low" | "medium" | "high".
+      reasoning_effort: "none",
+      max_tokens: 600,
     } as never,
   ) as unknown as Record<string, unknown>;
 

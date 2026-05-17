@@ -77,8 +77,8 @@ Cloudflare Worker (in [`worker/`](worker/)) backed by a D1 database.
 - `/` — structured search by name/address and delivery area, plus a
   natural-language search box at the top.
 - `/ask?q=…` — natural-language search. Cloudflare Workers AI
-  (`@cf/openai/gpt-oss-20b`, see [`model-pricing.md`](model-pricing.md)
-  and [`ai-perf.md`](ai-perf.md))
+  (`@cf/google/gemma-4-26b-a4b-it` with `reasoning_effort: "none"`, see
+  [`model-pricing.md`](model-pricing.md) and [`ai-perf.md`](ai-perf.md))
   parses the query into a structured intent (item keywords, area,
   landmark, service type, price ceiling, sort) and the worker runs a
   parameterized D1 query. Translates English place / dish names

@@ -15,7 +15,8 @@ doc is specifically about latency, throughput, and the streaming UX.
 - **Streaming the HTML response** gets the first usable pixel to the
   user in <300 ms regardless of what the LLM is doing.
 - For our workload the current sweet spot is
-  `@cf/openai/gpt-oss-20b`: ~1.5 s parse, ~$1.60 / 10 K queries.
+  **`@cf/google/gemma-4-26b-a4b-it` with `reasoning_effort: "none"`**:
+  ~1.5 s parse, ~$1.10 / 10 K queries.
 
 ## How we measure
 
@@ -53,22 +54,23 @@ curl -sS -o /dev/null -w "ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
 | Iteration | Model | parse | total | Notes |
 |---|---|---:|---:|---|
 | 1 | `@cf/meta/llama-3.1-8b-instruct` | 5–8 s | 5–8 s | Initial. Solid quality. |
-| 2 | `@cf/google/gemma-4-26b-a4b-it` | **10–13 s** | **10–13 s** | Reasoning model. Burned 1000+ output tokens on chain-of-thought before the JSON. |
-| 3 | `@cf/openai/gpt-oss-20b` *(current)* | **1.1–1.6 s** | **1.4–3.0 s** | Non-reasoning, similar capability, tool support. Required explicit place-name examples in the prompt. |
+| 2 | `@cf/google/gemma-4-26b-a4b-it` (default) | **10–13 s** | **10–13 s** | Reasoning model. Burned 1000+ output tokens on chain-of-thought before the JSON. |
+| 3 | `@cf/openai/gpt-oss-20b` | 1.1–1.6 s | 1.4–3.0 s | Non-reasoning; required explicit place-name examples in the prompt to match Gemma 4's geographic intuition. |
+| 4 | **`@cf/google/gemma-4-26b-a4b-it`** + `reasoning_effort: "none"` *(current)* | **1.1–1.8 s** | **1.1–2.2 s** | Same Gemma 4 model with the reasoning trace disabled. Best of both: cheapest input ($0.10/M) + the model's good multilingual intuition + non-reasoning latency. |
 
-Bare numbers from `wrangler tail` for the post-swap deploy:
+Bare numbers from `wrangler tail` for the current deploy:
 
 ```
-[ask] q="古亭站附近的炒飯"            parse=1349ms geo=11ms query=50ms total=1410ms
-[ask] q="fried rice near Taipei 101" parse=1407ms geo=7ms  query=50ms total=1464ms
-[ask] q="便當 in 內湖 under 100"     parse=1602ms geo=0ms  query=14ms total=1616ms
-[ask] q="新開的飲料店"                parse=1130ms geo=0ms  query=10ms total=1140ms
+[ask] q="古亭站附近的炒飯"            parse=1790ms geo=262ms query=116ms total=2168ms
+[ask] q="fried rice near Taipei 101" parse=1255ms geo=6ms   query=61ms  total=1322ms
+[ask] q="便當 in 內湖 under 100"     parse=1087ms geo=0ms   query=49ms  total=1136ms
+[ask] q="新開的飲料店"                parse=1204ms geo=0ms   query=16ms  total=1220ms
 ```
 
-### Why reasoning models killed latency
+### Why reasoning models look slow, and how to defuse it
 
-`@cf/google/gemma-4-26b-a4b-it` returns OpenAI-shaped chat completions
-with a `reasoning` field populated alongside `content`:
+By default, `@cf/google/gemma-4-26b-a4b-it` returns OpenAI-shaped chat
+completions with both `reasoning` and `content` populated:
 
 ```jsonc
 {
@@ -83,14 +85,36 @@ with a `reasoning` field populated alongside `content`:
 ```
 
 Inference time scales linearly with output tokens. A 1000-token
-reasoning trace at typical Workers AI latency works out to ~10 s.
-There is no API flag we found to disable the trace; the only fix was
-swapping to a non-reasoning model.
+reasoning trace at typical Workers AI latency works out to ~10 s, and
+if it eats all the `max_tokens` budget `content` arrives as `null`.
 
-The parser in `parseIntent` now defensively handles both shapes:
+The fix lives in the request, not the model swap: the Workers AI REST
+schema exposes a `reasoning_effort` parameter that accepts
+`"none" | "low" | "medium" | "high"`. Setting **`reasoning_effort:
+"none"`** suppresses the chain-of-thought completely — `reasoning` in
+the response comes back `null`, content arrives directly, and latency
+drops to gpt-oss-20b territory. We pass it through `env.AI.run(...)`
+options.
+
+Probed values:
+
+```bash
+# direct REST probe to verify the schema
+curl -H "Authorization: Bearer $CF_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"messages":[…],"reasoning_effort":"none"}' \
+  https://api.cloudflare.com/client/v4/accounts/$ACCT/ai/run/@cf/google/gemma-4-26b-a4b-it
+# 400 if the value is anything other than "none"|"low"|"medium"|"high"
+```
+
+`max_tokens` can also be tightened in this regime: once reasoning is
+off, a 500-token cap is plenty for the JSON response (we use 600).
+
+The parser in `parseIntent` keeps defensive handling for both shapes —
 `{response: "..."}` (Llama/Mistral) and
-`choices[0].message.{content, reasoning}` (OpenAI-style), and pulls
-JSON out of the `reasoning` field as a last resort.
+`choices[0].message.{content, reasoning}` (OpenAI-style) — and pulls
+JSON out of the `reasoning` field as a last resort if a model variant
+ever ignores the flag.
 
 ## Geocoding cost
 
@@ -155,17 +179,18 @@ behave correctly.
 
 ## Cost shape (current model)
 
-`@cf/openai/gpt-oss-20b`: $0.20 / M input tokens, $0.30 / M output.
-Our prompt averages ≈500 input + ≈200 output tokens per query:
+`@cf/google/gemma-4-26b-a4b-it`: $0.10 / M input tokens, $0.30 / M output.
+Our prompt averages ≈500 input + ≈200 output tokens per query (with
+reasoning off, output stays small):
 
 ```
-cost / query ≈ 500/1M × 0.20 + 200/1M × 0.30
-            ≈ $0.00010 + $0.00006
-            ≈ $0.00016  (~$1.60 per 10,000 queries)
+cost / query ≈ 500/1M × 0.10 + 200/1M × 0.30
+            ≈ $0.00005 + $0.00006
+            ≈ $0.00011  (~$1.10 per 10,000 queries)
 ```
 
-In neuron terms that's ~15 neurons / query, so the free 10,000 / day
-tier covers about **650 NL queries / day** before any billing kicks in.
+In neuron terms that's ~10 neurons / query, so the free 10,000 / day
+tier covers about **1,000 NL queries / day** before any billing kicks in.
 
 ## What to try if things slow down again
 
