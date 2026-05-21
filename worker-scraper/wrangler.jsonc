@@ -32,8 +32,12 @@
       }
     ]
   },
-  // Cron disabled for v1 — manual /enqueue only until first sweep validates.
-  // Re-enable with a Cloudflare-accepted cron expression after smoke test.
+  "triggers": {
+    // Sunday 18:00 UTC = Monday 02:00 Taipei.
+    // Cloudflare uses Quartz cron: day-of-week is 1-7 with Sunday=1,
+    // NOT POSIX 0-6. "0 18 * * 0" fails with code 10100.
+    "crons": ["0 18 * * SUN"]
+  },
   "vars": {
     "STALE_DAYS": "30",
     "TILE_RADIUS_M": "500"
