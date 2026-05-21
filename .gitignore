@@ -15,3 +15,14 @@ shops_d1.sql
 # secrets
 cftoken.env
 *.env
+worker-scraper/.scrape-key.local
+
+# worker build artifacts
+worker-scraper/node_modules/
+worker-scraper/.wrangler/
+worker/node_modules/
+worker/.wrangler/
+
+# editor / tooling
+.claude/
+*.swp

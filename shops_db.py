@@ -26,11 +26,23 @@ CREATE TABLE IF NOT EXISTS shops (
     notice              TEXT,
     public_notice       TEXT,
     shared_shop         INTEGER,
-    partner             INTEGER
+    partner             INTEGER,
+    -- Multi-source extension (matches D1 migration 0001).
+    -- 'dinbendon' rows leave the gmaps columns NULL.
+    source              TEXT NOT NULL DEFAULT 'dinbendon',
+    external_id         TEXT,
+    rating              REAL,
+    rating_count        INTEGER,
+    price_level         INTEGER,
+    opening_hours_json  TEXT,
+    gmaps_types_json    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_shops_name     ON shops(name);
 CREATE INDEX IF NOT EXISTS idx_shops_owner    ON shops(owner_name);
 CREATE INDEX IF NOT EXISTS idx_shops_modified ON shops(last_modified_date);
+CREATE INDEX IF NOT EXISTS idx_shops_source   ON shops(source);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shops_source_external
+    ON shops(source, external_id) WHERE external_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS shop_sent_areas (
     shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
@@ -127,9 +139,14 @@ def upsert_shop(con: sqlite3.Connection, shop_id: int, data: dict) -> bool:
         return False
 
     con.execute("DELETE FROM shops WHERE id = ?", (shop_id,))
+    # Named columns so adding new ones (source, external_id, gmaps fields)
+    # doesn't require touching this insert.
     con.execute(
-        """INSERT INTO shops VALUES
-           (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO shops
+           (id, shop_hash_id, name, description, url, tel_no, fax_no, address,
+            lat, lng, last_modified_date, revision_no, owner_name, notice,
+            public_notice, shared_shop, partner, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'dinbendon')""",
         (
             shop_id,
             detail.get("shopHashId"),
