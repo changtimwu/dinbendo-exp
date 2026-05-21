@@ -361,6 +361,42 @@ const NOMINATIM_UA = "dinbendon.itsi.xyz (https://dinbendon.itsi.xyz; https://gi
 const SERVICE_TYPES = ["便當", "中式", "麵食", "飲料", "小吃", "日式", "其他", "甜點", "南洋", "西式"] as const;
 const SORTS = ["price_asc", "price_desc", "newest", "relevance"] as const;
 
+// Try one call to env.AI.run and recover a JSON object from its response,
+// regardless of which response shape Workers AI uses or whether the model
+// wrapped the JSON in prose / markdown. Returns null when nothing parses.
+async function tryParseIntentCall(env: Env, systemPrompt: string, userPrompt: string): Promise<Record<string, unknown> | null> {
+  const res = await env.AI.run(
+    NL_MODEL as keyof AiModels,
+    {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_schema", json_schema: INTENT_SCHEMA },
+      reasoning_effort: "none",
+      max_tokens: 600,
+    } as never,
+  ) as unknown as Record<string, unknown>;
+
+  let text: string | unknown = res?.response;
+  if (typeof text !== "string" && Array.isArray(res?.choices)) {
+    const choice = (res.choices as Array<{ message?: { content?: unknown; reasoning?: unknown } }>)[0];
+    text = choice?.message?.content;
+    if (typeof text !== "string" || !text) text = choice?.message?.reasoning;
+  }
+
+  if (typeof text === "string") {
+    try { return JSON.parse(text); } catch { /* try prose fallback */ }
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch { /* fall through */ }
+    }
+  } else if (text && typeof text === "object") {
+    return text as Record<string, unknown>;
+  }
+  return null;
+}
+
 async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
   const system = [
     "You parse food-delivery search queries for a Taiwanese platform into JSON.",
@@ -391,51 +427,28 @@ async function parseIntent(env: Env, query: string): Promise<ParsedIntent> {
     'A: {"item_keywords":[],"area":null,"near_landmark":"台灣大學","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"shop","limit":20,"rationale":"台大附近的咖啡店"}',
   ].join("\n");
 
-  const res = await env.AI.run(
-    NL_MODEL as keyof AiModels,
-    {
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: query },
-      ],
-      response_format: { type: "json_schema", json_schema: INTENT_SCHEMA },
-      // Gemma 4 26b is a reasoning model. reasoning_effort="none" suppresses
-      // the chain-of-thought trace so we get the JSON directly and parse
-      // latency drops from ~10s to ~1-2s. Valid: "none" | "low" | "medium" | "high".
-      reasoning_effort: "none",
-      max_tokens: 600,
-    } as never,
-  ) as unknown as Record<string, unknown>;
+  // First pass: the well-tuned prompt with examples. Succeeds ~95% of the time.
+  let obj = await tryParseIntentCall(env, system, query);
 
-  // Extract the text the model produced. Workers AI normalizes responses
-  // differently per model family:
-  //   - Llama / Mistral instruct → { response: "..." }
-  //   - Gemma 4 / OpenAI-style    → { choices: [{ message: { content: "...", reasoning: "..." } }] }
-  let text: string | unknown = res?.response;
-  if (typeof text !== "string" && Array.isArray(res?.choices)) {
-    const choice = (res.choices as Array<{ message?: { content?: unknown; reasoning?: unknown } }>)[0];
-    text = choice?.message?.content;
-    if (typeof text !== "string" || !text) text = choice?.message?.reasoning;
+  // Recovery pass: Gemma 4 occasionally ignores `response_format` and
+  // outputs a markdown-bulleted reasoning trace with no { … } anywhere.
+  // The regex fallback can't recover that, so retry once with a stripped
+  // system prompt that constrains output even harder. Keeps the same
+  // schema + model for consistency.
+  if (!obj) {
+    const strict = [
+      "You parse food-delivery search queries into JSON for a Taiwanese platform.",
+      "OUTPUT RULES (non-negotiable): respond with a single JSON object only. The first character MUST be `{` and the last MUST be `}`. No prose, no markdown, no bullets, no explanation.",
+      `Schema fields: item_keywords (string[]), area (string|null), near_landmark (string|null), service_type (string|null, one of: ${SERVICE_TYPES.join(", ")}), sort_by (one of: ${SORTS.join(", ")}), max_price (number|null), result_grain ("product"|"shop"), limit (number, default 20), rationale (string).`,
+      "near_landmark holds MRT stations / buildings / universities / roads (preserve city qualifiers, append 站 for stations). area holds broad districts only.",
+      'Example. Q: 古亭站附近的炒飯',
+      'A: {"item_keywords":["炒飯"],"area":null,"near_landmark":"古亭站","service_type":null,"sort_by":"relevance","max_price":null,"result_grain":"product","limit":20,"rationale":"古亭站附近的炒飯"}',
+    ].join("\n");
+    obj = await tryParseIntentCall(env, strict, query);
+    if (obj) console.log(`[ask] q=${JSON.stringify(query)} parseIntent recovered on retry`);
   }
 
-  let obj: Record<string, unknown> | undefined;
-  if (typeof text === "string") {
-    try {
-      obj = JSON.parse(text);
-    } catch {
-      // Recover a JSON object embedded in prose (```json … ``` or reasoning trace).
-      const m = text.match(/\{[\s\S]*\}/);
-      if (m) {
-        try { obj = JSON.parse(m[0]); } catch { /* fall through */ }
-      }
-    }
-  } else if (text && typeof text === "object") {
-    obj = text as Record<string, unknown>;
-  }
-  if (!obj || typeof obj !== "object") {
-    const sample = typeof text === "string" ? text.slice(0, 200) : JSON.stringify(res).slice(0, 200);
-    throw new Error(`model returned no JSON: ${sample}`);
-  }
+  if (!obj) throw new Error("model returned no JSON after retry");
 
   const sort = (SORTS as readonly string[]).includes(obj.sort_by as string)
     ? (obj.sort_by as ParsedIntent["sort_by"])
