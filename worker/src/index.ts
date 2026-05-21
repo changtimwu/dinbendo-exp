@@ -66,6 +66,10 @@ async function renderSearch(env: Env, url: URL): Promise<Response> {
     owner_name: string | null;
     last_modified_date: string | null;
     img_count: number;
+    source: string;
+    rating: number | null;
+    rating_count: number | null;
+    gmaps_types_json: string | null;
   };
 
   let rows: Row[] = [];
@@ -91,6 +95,7 @@ async function renderSearch(env: Env, url: URL): Promise<Response> {
 
     const listRes = await env.DB.prepare(
       `SELECT s.id, s.name, s.address, s.tel_no, s.owner_name, s.last_modified_date,
+              s.source, s.rating, s.rating_count, s.gmaps_types_json,
               COALESCE((SELECT COUNT(*) FROM products p JOIN categories c ON c.id = p.category_id
                         WHERE c.shop_id = s.id AND p.image_url IS NOT NULL), 0) AS img_count
        FROM shops s ${where}
@@ -142,22 +147,47 @@ function rowHtml(r: {
   owner_name: string | null;
   last_modified_date: string | null;
   img_count: number;
+  source?: string | null;
+  rating?: number | null;
+  rating_count?: number | null;
+  gmaps_types_json?: string | null;
   dist_km?: number;
 }): string {
-  const imgBadge = r.img_count > 0
-    ? `<span class="badge" title="${r.img_count} 張產品圖">📷 ${r.img_count}</span>`
-    : "";
+  const isGmaps = r.source === "gmaps";
   const distBadge = r.dist_km != null
     ? `<span class="badge dist">${r.dist_km.toFixed(2)} km</span>`
     : "";
+  const srcBadge = isGmaps
+    ? `<span class="badge src-gmaps" title="from Google Maps">🗺 maps</span>`
+    : "";
+  const ratingBadge = isGmaps && r.rating != null
+    ? `<span class="badge rating" title="${r.rating_count ?? "?"} reviews">★ ${r.rating.toFixed(1)}</span>`
+    : "";
+  const imgBadge = !isGmaps && r.img_count > 0
+    ? `<span class="badge" title="${r.img_count} 張產品圖">📷 ${r.img_count}</span>`
+    : "";
+  // gmaps cuisine type goes in the meta line; dinbendon shows owner + updated date.
+  let cuisine = "";
+  if (isGmaps && r.gmaps_types_json) {
+    try {
+      const arr = JSON.parse(r.gmaps_types_json) as unknown[];
+      if (Array.isArray(arr) && arr.length && typeof arr[0] === "string") {
+        cuisine = `🍴 ${escapeHtml(arr[0])}`;
+      }
+    } catch { /* malformed JSON — skip */ }
+  }
+  const dinbendonMeta = isGmaps ? "" : [
+    r.tel_no ? `☎ ${escapeHtml(r.tel_no)}` : "",
+    r.owner_name ? ` · ${escapeHtml(r.owner_name)}` : "",
+    r.last_modified_date ? ` · 更新 ${escapeHtml(r.last_modified_date)}` : "",
+  ].join("");
   return /* html */ `
-    <li>
-      <a href="/shop/${r.id}" class="name">${escapeHtml(r.name)}</a> ${imgBadge}${distBadge}
+    <li${isGmaps ? ' class="gmaps"' : ""}>
+      <a href="/shop/${r.id}" class="name">${escapeHtml(r.name)}</a> ${srcBadge}${ratingBadge}${imgBadge}${distBadge}
       <div class="addr">${escapeHtml(r.address ?? "—")}</div>
       <div class="meta">
-        ${r.tel_no ? `☎ ${escapeHtml(r.tel_no)}` : ""}
-        ${r.owner_name ? ` · ${escapeHtml(r.owner_name)}` : ""}
-        ${r.last_modified_date ? ` · 更新 ${escapeHtml(r.last_modified_date)}` : ""}
+        ${cuisine}
+        ${dinbendonMeta}
         · id ${r.id}
       </div>
     </li>
@@ -595,31 +625,61 @@ type ShopRow = {
   owner_name: string | null;
   last_modified_date: string | null;
   img_count: number;
+  source: string;
+  rating: number | null;
+  rating_count: number | null;
+  gmaps_types_json: string | null;
   lat?: number | null;
   lng?: number | null;
   dist_km?: number;
 };
 
-async function runShopSearch(db: D1Database, intent: ParsedIntent, near: Near | null): Promise<ShopRow[]> {
+// Single shop-grain SQL covering both dinbendon and gmaps rows.
+// area / service_type filters use EXISTS subqueries that naturally exclude
+// gmaps rows (which have no entries in shop_sent_areas / shop_service_types),
+// so "便當 in 內湖" stays dinbendon-only — gmaps doesn't know that metadata.
+// item_keywords match name OR address OR gmaps_types_json so a query like
+// "Japanese near 台北101" hits gmaps cuisine types.
+async function runShopSearch(
+  db: D1Database,
+  intent: ParsedIntent,
+  near: Near | null,
+  opts: {
+    sourceFilter?: "gmaps" | "dinbendon";
+    limitOverride?: number;
+    // Extra keywords ORed into the keyword filter alongside item_keywords.
+    // Used by the product-grain sidecar to pass raw English tokens, since
+    // gmaps_types_json stores English ("Ramen restaurant") while the LLM
+    // often translates item_keywords into Chinese.
+    extraKeywords?: string[];
+  } = {},
+): Promise<ShopRow[]> {
   const bindings: unknown[] = [];
   const filters: string[] = [];
 
-  if (intent.area) {
+  if (opts.sourceFilter) {
+    bindings.push(opts.sourceFilter);
+    filters.push(`s.source = ?${bindings.length}`);
+  }
+  // area + service_type live in dinbendon-only side tables. Skip them when
+  // the caller wants only gmaps rows (otherwise the EXISTS subqueries
+  // always fail and the sidecar returns 0 results).
+  const skipDinbendonFilters = opts.sourceFilter === "gmaps";
+  if (intent.area && !skipDinbendonFilters) {
     bindings.push(intent.area);
     filters.push(`EXISTS (SELECT 1 FROM shop_sent_areas a WHERE a.shop_id = s.id AND a.area = ?${bindings.length})`);
   }
-  if (intent.service_type) {
+  if (intent.service_type && !skipDinbendonFilters) {
     bindings.push(intent.service_type);
     filters.push(`EXISTS (SELECT 1 FROM shop_service_types t WHERE t.shop_id = s.id AND t.service_type = ?${bindings.length})`);
   }
-  // Keywords on shop grain: match name or address (OR-of-keywords, each keyword OR-of-fields).
-  if (intent.item_keywords.length) {
+  const keywords = [...intent.item_keywords.slice(0, 5), ...(opts.extraKeywords ?? []).slice(0, 5)];
+  if (keywords.length) {
     const parts: string[] = [];
-    for (const k of intent.item_keywords.slice(0, 5)) {
+    for (const k of keywords) {
       bindings.push(`%${k}%`);
-      parts.push(`s.name LIKE ?${bindings.length}`);
-      bindings.push(`%${k}%`);
-      parts.push(`s.address LIKE ?${bindings.length}`);
+      const i = bindings.length;
+      parts.push(`s.name LIKE ?${i}`, `s.address LIKE ?${i}`, `s.gmaps_types_json LIKE ?${i}`);
     }
     filters.push(`(${parts.join(" OR ")})`);
   }
@@ -631,12 +691,15 @@ async function runShopSearch(db: D1Database, intent: ParsedIntent, near: Near | 
   }
 
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  // Without proximity: dinbendon by last_modified_date (NULL for gmaps, so they sink).
+  // With proximity: distance rerank in JS, so initial order is just a candidate pool.
   const orderBy = "s.last_modified_date DESC";
-  const fetchLimit = near ? Math.max(intent.limit * 5, 50) : intent.limit;
+  const limit = opts.limitOverride ?? intent.limit;
+  const fetchLimit = near ? Math.max(limit * 5, 50) : limit;
 
   const sql = `
     SELECT s.id, s.name, s.address, s.tel_no, s.owner_name, s.last_modified_date,
-           s.lat, s.lng,
+           s.lat, s.lng, s.source, s.rating, s.rating_count, s.gmaps_types_json,
            COALESCE((SELECT COUNT(*) FROM products p JOIN categories c ON c.id = p.category_id
                      WHERE c.shop_id = s.id AND p.image_url IS NOT NULL), 0) AS img_count
     FROM shops s
@@ -653,7 +716,7 @@ async function runShopSearch(db: D1Database, intent: ParsedIntent, near: Near | 
     .map(x => ({ ...x, dist_km: distanceKm(near.lat, near.lng, x.lat!, x.lng!) }))
     .filter(x => x.dist_km! <= near.radiusKm)
     .sort((a, b) => a.dist_km! - b.dist_km!)
-    .slice(0, intent.limit);
+    .slice(0, limit);
 }
 
 function askFormHtml(q: string): string {
@@ -763,18 +826,33 @@ async function renderAsk(env: Env, url: URL): Promise<Response> {
       let resultsHtml: string;
       if (intent.result_grain === "product") {
         const rows = await runProductSearch(env.DB, intent, near);
-        resultsHtml = rows.length
+        // Sidecar: gmaps shops nearby that match the same keywords. Only
+        // shown when proximity is active — without near, gmaps shops have
+        // no useful filter (no service_type, no area, no last_modified).
+        // Pass raw query tokens as extra keywords so English words like
+        // "ramen" can still match English gmaps_types_json even after the
+        // LLM translates item_keywords into Chinese.
+        const rawTokens = q.split(/[\s,]+/).filter((t) => /^[A-Za-z]{3,}$/.test(t));
+        const gmapsRows = near
+          ? await runShopSearch(env.DB, intent, near, { sourceFilter: "gmaps", limitOverride: 10, extraKeywords: rawTokens })
+          : [];
+        const productList = rows.length
           ? `<ul class="results products">${rows.map(productRowHtml).join("")}</ul>`
           : `<p class="empty">沒有符合的菜單項目。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
+        const gmapsSection = gmapsRows.length
+          ? `<h3 class="gmaps-heading">🍽 附近的餐廳 <small>(Google Maps)</small></h3><ul class="results gmaps-list">${gmapsRows.map(rowHtml).join("")}</ul>`
+          : "";
+        resultsHtml = productList + gmapsSection;
         t3 = Date.now();
-        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=product rows=${rows.length}`);
+        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=product rows=${rows.length} gmaps=${gmapsRows.length}`);
       } else {
         const rows = await runShopSearch(env.DB, intent, near);
         resultsHtml = rows.length
           ? `<ul class="results">${rows.map(rowHtml).join("")}</ul>`
           : `<p class="empty">沒有符合的店家。${near ? `(在 ${escapeHtml(intent.near_landmark!)} ${PROXIMITY_RADIUS_KM}km 範圍內) ` : ""}試試放寬條件，或<a href="/">改用結構化搜尋</a>。</p>`;
         t3 = Date.now();
-        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=shop rows=${rows.length}`);
+        const gmapsCount = rows.filter((x) => x.source === "gmaps").length;
+        console.log(`[ask] q=${JSON.stringify(q)} parse=${t1 - t0}ms geo=${t2 - t1}ms query=${t3 - t2}ms total=${t3 - t0}ms grain=shop rows=${rows.length} gmaps=${gmapsCount}`);
       }
 
       const lateHtml = /* html */ `
@@ -900,7 +978,12 @@ function layoutHead(title: string): string {
   .intent .geo { color: #666; font-size: .82em; margin-top: .35rem; }
   .intent .geo-miss { color: #b56500; }
   .badge.dist { background: #e6f4ec; color: #1f7a3a; }
+  .badge.src-gmaps { background: #e8efff; color: #2a4bbf; }
+  .badge.rating { background: #fff7d1; color: #8a6500; }
   .dist-inline { color: #1f7a3a; font-weight: 600; }
+  h3.gmaps-heading { margin-top: 1.6rem; font-size: 1.02em; color: #2a4bbf; }
+  h3.gmaps-heading small { color: #6a7282; font-weight: normal; font-size: .9em; }
+  ul.results.gmaps-list { margin-top: .35rem; }
   .searching { display: flex; align-items: center; gap: .6rem; padding: .8rem 1rem; background: #fafbfd; border: 1px solid #e6e9ef; border-radius: 8px; margin: .6rem 0 1rem; color: #555; }
   .searching .status { color: #888; font-size: .9em; }
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #d6d9e0; border-top-color: #6a3aff; border-radius: 50%; animation: spin .8s linear infinite; }
@@ -911,7 +994,11 @@ function layoutHead(title: string): string {
     .intent .geo { color: #aab2c0; }
     .intent .geo-miss { color: #f3c463; }
     .badge.dist { background: #1f3a2a; color: #7ad58e; }
+    .badge.src-gmaps { background: #1f2a4a; color: #9bb4ff; }
+    .badge.rating { background: #4a3a14; color: #f3d063; }
     .dist-inline { color: #7ad58e; }
+    h3.gmaps-heading { color: #9bb4ff; }
+    h3.gmaps-heading small { color: #8a93a6; }
     .searching { background: #181c25; border-color: #2a2c33; color: #b9bfca; }
     .spinner { border-color: #2a2c33; border-top-color: #c6b6ff; }
     .timings { color: #8a93a6; }
