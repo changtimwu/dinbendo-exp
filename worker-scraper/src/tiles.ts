@@ -11,13 +11,17 @@ export interface Tile {
   radiusM: number;
 }
 
-// Taipei City bounding box. Tight on purpose for v1 — expand to New
-// Taipei after the first sweep validates coverage and captcha rates.
+// Taipei City + New Taipei urban core. The bbox wraps the dense
+// districts of New Taipei (Banqiao, Sanchong, Xinzhuang, Linkou,
+// Yonghe, Zhonghe, Tucheng, Shulin, Xindian, Sanxia, Xizhi, southern
+// Tamsui) while leaving out far-rural Pingxi / Shuangxi / Wulai
+// mountains and the north/west coast strip. Cost: ~6 browser-hours
+// for a full re-sweep at ~700 m spacing, ≈ 1,800 tiles.
 const BBOX = {
-  south: 25.00,
-  north: 25.15,
-  west:  121.50,
-  east:  121.61,
+  south: 24.92,
+  north: 25.20,
+  west:  121.40,
+  east:  121.66,
 };
 
 // ~700 m spacing. 1 deg lat ≈ 111 km; 1 deg lng at 25°N ≈ 100.7 km.

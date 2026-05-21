@@ -32,34 +32,46 @@ queue (`gmaps-tiles`) and a consumer that drains it.
 - Queue backlog on the dashboard is 0.
 - No new `[tile]` log lines for >2 minutes.
 
-### State as of the first Taipei City sweep (2026-05-21)
+### State as of the Taipei + New Taipei urban sweep (2026-05-22)
 
 ```
-status=ok    n=380
-status=empty n=4    (water / coverage-edge tiles, no restaurants returned)
-status=error n=0
+status=ok    n=1629
+status=empty n=80   (water / mountains / coverage-edge tiles)
+status=error n=1    (one stubborn tile after a retry pass)
 status=blocked n=0
 DLQ depth=0
-gmaps_shops=6749
+gmaps_shops=15617
 ```
 
-The 4 `empty` tiles are expected for any tile centered over water,
-parks, or low-density edges of the bbox. They are not failures —
-they had no restaurant results to return.
+The bbox covers Taipei City + the dense districts of New Taipei
+(Banqiao, Sanchong, Xinzhuang, Linkou, Yonghe, Zhonghe, Tucheng,
+Shulin, Xindian, Sanxia, Xizhi, southern Tamsui). 1,710 tiles total
+at ~700 m spacing.
+
+Sweep notes:
+- 15 tiles initially got stuck `pending` (queue messages dropped or
+  worker terminated mid-process) and ~35 errored transiently. A
+  `mode=stale` re-enqueue cleaned all but 1 of them. Lesson: after
+  any full sweep, do a follow-up `POST /enqueue?mode=stale` to
+  sweep up stragglers before declaring done.
+- The first Taipei-only sweep (2026-05-21, 384 tiles, 6,749 shops)
+  is included in this run since the new bbox uses a different
+  origin → all old `gmaps_tile_state` rows were truncated before
+  re-seeding. Shop rows persisted (upsert by `(source, external_id)`).
 
 ## Cost — what the sweep actually used
 
 Everything stayed inside the **Workers Paid plan** ($5/month, already
 in place). Marginal cost of the full Taipei City sweep was **$0**.
 
-| Resource | First-sweep usage | Plan included | Per-unit overage price |
+| Resource | Cumulative usage | Plan included | Per-unit overage price |
 |---|---|---|---|
-| Browser Rendering hours | ~1.3 hr (~384 sessions × ~12 s) | 10 hr/month | $0.09 / hr |
+| Browser Rendering hours | ~7 hr cumulative (Taipei sweep + NT expansion + retries) | 10 hr/month | $0.09 / hr |
 | Browser concurrency | 5 (configured), 10 included | 10 (averaged monthly) | $2.00 / month per extra |
-| Workers requests (24h window) | 461 requests, 796 subrequests, 0 errors | 10M / month | $0.30 / 1M |
-| Queue operations | ~770 (384 enqueue + 384 ack + ~2 misc) | 1M / month free, then $0.40 / 1M | — |
-| D1 rows written | ~30K (initial upsert) | 50K / day on Paid | $1.00 / 1M |
-| D1 rows read | ~40K | 25M / day on Paid | $0.001 / 1K |
+| Workers requests | a few thousand over ~24h, 0 errors | 10M / month | $0.30 / 1M |
+| Queue operations | ~3,500 (~1,710 enqueue + ~1,710 ack + retries) | 1M / month free, then $0.40 / 1M | — |
+| D1 rows written | ~50K (~30K upsert + ~20K refresh) | 50K / day on Paid | $1.00 / 1M |
+| D1 rows read | ~80K | 25M / day on Paid | $0.001 / 1K |
 
 Refreshes will be much cheaper than the initial sweep: each weekly
 re-run scrapes only stale tiles (status != ok OR last_run > 30 days),
