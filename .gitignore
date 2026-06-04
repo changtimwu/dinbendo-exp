@@ -26,3 +26,8 @@ worker/.wrangler/
 # editor / tooling
 .claude/
 *.swp
+
+# marathon-gpx tool
+tools/marathon-gpx/.venv/
+tools/marathon-gpx/__pycache__/
+tools/marathon-gpx/course-map.jpg
